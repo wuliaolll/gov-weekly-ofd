@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>政务周报 OFD 生成器</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@600;700&family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            gov: { red: '#C41E24', gold: '#B8860B', bg: '#FAFAF5', border: '#E5E2D9', text: '#1A1A1A', muted: '#6B7280' },
+          },
+          fontFamily: {
+            title: ['"Noto Serif SC"', 'serif'],
+            body: ['"Noto Sans SC"', 'sans-serif'],
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .scrollbar-thin::-webkit-scrollbar { width: 6px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-gov-bg text-gov-text font-body min-h-screen" x-data="app()" x-init="init()">
+
+  <!-- 红色顶部横杠 -->
+  <div class="h-1.5 bg-gov-red"></div>
+
+  <!-- 标题栏 -->
+  <header class="bg-white border-b border-gov-border shadow-sm">
+    <div class="max-w-6xl mx-auto px-6 py-5 flex items-center justify-between">
+      <div>
+        <h1 class="font-title text-2xl font-bold text-gov-red tracking-wide">政务周报 OFD 生成器</h1>
+        <p class="text-sm text-gov-muted mt-1">自动采集 · 公文排版 · DOCX & OFD 生成</p>
+      </div>
+      <div x-show="status.running" x-cloak class="flex items-center gap-2 text-sm text-gov-red">
+        <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+        <span x-text="status.current"></span>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-6 py-6 space-y-6">
+
+    <!-- 配置区 -->
+    <section class="bg-white rounded-lg border border-gov-border shadow-sm p-5">
+      <h2 class="font-title text-lg font-bold text-gov-text mb-4 flex items-center gap-2">
+        <svg class="w-5 h-5 text-gov-red" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><circle cx="12" cy="12" r="3"/></svg>
+        系统配置
+      </h2>
+      <div class="grid md:grid-cols-2 gap-4">
+        <div class="md:col-span-2">
+          <label class="block text-sm font-medium text-gov-muted mb-1">栏目页 URL</label>
+          <input type="url" x-model="config.column_url"
+            class="w-full border border-gov-border rounded-md px-3 py-2 text-sm focus:ring-2 focus:ring-gov-red/30 focus:border-gov-red outline-none"
+            placeholder="https://www.hubei.gov.cn/hbfb/zwzb/index.shtml">
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gov-muted mb-1">定时采集时间</label>
+          <div class="flex items-center gap-2">
+            <input type="number" x-model.number="config.schedule_hour" min="0" max="23"
+              class="w-20 border border-gov-border rounded-md px-3 py-2 text-sm focus:ring-2 focus:ring-gov-red/30 focus:border-gov-red outline-none"> 时
+            <input type="number" x-model.number="config.schedule_minute" min="0" max="59"
+              class="w-20 border border-gov-border rounded-md px-3 py-2 text-sm focus:ring-2 focus:ring-gov-red/30 focus:border-gov-red outline-none"> 分
+          </div>
+        </div>
+        <div class="flex items-end">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="config.auto_collect" class="w-4 h-4 rounded text-gov-red focus:ring-gov-red">
+            <span class="text-sm">启用自动采集</span>
+          </label>
+        </div>
+      </div>
+      <div class="flex items-center gap-3 mt-4 pt-4 border-t border-gov-border">
+        <button @click="saveConfig()"
+          class="px-4 py-2 bg-gov-red text-white text-sm font-medium rounded-md hover:bg-red-800 transition">
+          保存配置
+        </button>
+        <button @click="previewColumn()"
+          class="px-4 py-2 border border-gov-red text-gov-red text-sm font-medium rounded-md hover:bg-red-50 transition">
+          预览栏目
+        </button>
+        <button @click="collectAll()" :disabled="status.running"
+          class="px-4 py-2 bg-gov-gold text-white text-sm font-medium rounded-md hover:opacity-90 transition disabled:opacity-50">
+          全量采集生成
+        </button>
+        <span x-show="configMsg" x-cloak x-text="configMsg" class="text-sm text-green-600"></span>
+      </div>
+    </section>
+
+    <!-- 栏目预览 -->
+    <section x-show="previewList.length > 0" x-cloak class="bg-white rounded-lg border border-gov-border shadow-sm p-5">
+      <h2 class="font-title text-lg font-bold text-gov-text mb-3">栏目预览</h2>
+      <div class="space-y-2 max-h-64 overflow-y-auto scrollbar-thin">
+        <template x-for="(item, i) in previewList" :key="i">
+          <div class="flex items-center justify-between py-2 px-3 rounded hover:bg-gov-bg border border-transparent hover:border-gov-border">
+            <div>
+              <span class="text-sm font-medium" x-text="item.title"></span>
+              <span class="text-xs text-gov-muted ml-2" x-text="item.pub_date"></span>
+            </div>
+            <button @click="collectOne(item.url)"
+              :disabled="status.running"
+              class="text-xs px-3 py-1 bg-gov-red text-white rounded hover:bg-red-800 transition disabled:opacity-50">
+              采集此期
+            </button>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- 任务状态 -->
+    <section x-show="status.running || status.log.length > 0" x-cloak class="bg-white rounded-lg border border-gov-border shadow-sm p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-title text-lg font-bold text-gov-text">任务状态</h2>
+        <template x-if="status.total > 0">
+          <span class="text-sm text-gov-muted">
+            <span x-text="status.progress"></span> / <span x-text="status.total"></span>
+          </span>
+        </template>
+      </div>
+      <!-- 进度条 -->
+      <div x-show="status.running && status.total > 0" class="w-full bg-gray-200 rounded-full h-2 mb-3">
+        <div class="bg-gov-red h-2 rounded-full transition-all" :style="'width:' + (status.total ? (status.progress/status.total*100) : 0) + '%'"></div>
+      </div>
+      <!-- 日志 -->
+      <div class="bg-gray-50 rounded-md p-3 max-h-48 overflow-y-auto scrollbar-thin font-mono text-xs leading-relaxed"
+           x-ref="logBox">
+        <template x-for="(line, i) in status.log" :key="i">
+          <div x-text="line" :class="line.includes('✗') ? 'text-red-600' : line.includes('✓') ? 'text-green-600' : 'text-gray-700'"></div>
+        </template>
+      </div>
+      <button x-show="!status.running && status.log.length > 0" @click="clearLog()"
+        class="mt-2 text-xs text-gov-muted hover:text-gov-red transition">清除日志</button>
+    </section>
+
+    <!-- 周报文件列表 -->
+    <section class="bg-white rounded-lg border border-gov-border shadow-sm p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="font-title text-lg font-bold text-gov-text flex items-center gap-2">
+          <svg class="w-5 h-5 text-gov-red" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>
+          已生成文件
+        </h2>
+        <button @click="loadReports()" class="text-sm text-gov-red hover:underline">刷新</button>
+      </div>
+
+      <div x-show="reports.length === 0" class="text-center py-10 text-gov-muted text-sm">暂无已生成的周报文件</div>
+
+      <!-- 年份 → 周期 → 领导 → 日期 → 文件 -->
+      <div class="space-y-4">
+        <template x-for="year in reports" :key="year.name">
+          <div>
+            <button @click="year._open = !year._open" class="flex items-center gap-2 text-base font-bold text-gov-text hover:text-gov-red w-full text-left py-1">
+              <svg class="w-4 h-4 transition-transform" :class="year._open && 'rotate-90'" fill="currentColor" viewBox="0 0 20 20"><path d="M6 4l8 6-8 6V4z"/></svg>
+              <span x-text="year.name"></span>
+            </button>
+            <div x-show="year._open" x-cloak class="ml-6 space-y-3 mt-2">
+              <template x-for="range in year.ranges" :key="range.name">
+                <div class="border border-gov-border rounded-lg overflow-hidden">
+                  <button @click="range._open = !range._open"
+                    class="w-full text-left px-4 py-3 bg-gov-bg hover:bg-gray-100 flex items-center justify-between">
+                    <span class="font-medium text-sm" x-text="range.name"></span>
+                    <span class="text-xs text-gov-muted" x-text="range.leaders.length + ' 位领导'"></span>
+                  </button>
+                  <div x-show="range._open" x-cloak class="divide-y divide-gov-border">
+                    <template x-for="leader in range.leaders" :key="leader.name">
+                      <div class="px-4 py-3">
+                        <button @click="leader._open = !leader._open" class="text-sm font-medium text-gov-red hover:underline flex items-center gap-1">
+                          <svg class="w-3 h-3 transition-transform" :class="leader._open && 'rotate-90'" fill="currentColor" viewBox="0 0 20 20"><path d="M6 4l8 6-8 6V4z"/></svg>
+                          <span x-text="leader.name"></span>
+                        </button>
+                        <div x-show="leader._open" x-cloak class="mt-2 ml-4 space-y-2">
+                          <template x-for="dateGroup in leader.dates" :key="dateGroup.name">
+                            <div>
+                              <div class="text-xs font-medium text-gov-muted mb-1" x-text="dateGroup.name"></div>
+                              <div class="space-y-1">
+                                <template x-for="file in dateGroup.files" :key="file.path">
+                                  <a :href="'/api/download/' + encodeURI(file.path)"
+                                    class="flex items-center gap-2 text-sm py-1 px-2 rounded hover:bg-gov-bg group">
+                                    <span class="inline-block w-10 text-center text-xs font-bold rounded py-0.5"
+                                      :class="file.type === 'ofd' ? 'bg-red-100 text-gov-red' : 'bg-blue-100 text-blue-700'"
+                                      x-text="file.type.toUpperCase()"></span>
+                                    <span class="truncate group-hover:text-gov-red transition" x-text="file.name"></span>
+                                    <span class="text-xs text-gov-muted ml-auto" x-text="(file.size / 1024).toFixed(1) + ' KB'"></span>
+                                  </a>
+                                </template>
+                              </div>
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+  </main>
+
+  <!-- 底部 -->
+  <footer class="text-center py-6 text-xs text-gov-muted border-t border-gov-border mt-8">
+    政务周报 OFD 生成器 · 仅供内部使用
+  </footer>
+
+  <script>
+    function app() {
+      return {
+        config: { column_url: '', schedule_hour: 8, schedule_minute: 0, auto_collect: true },
+        configMsg: '',
+        previewList: [],
+        reports: [],
+        status: { running: false, current: '', progress: 0, total: 0, log: [] },
+        _pollTimer: null,
+
+        async init() {
+          await this.loadConfig();
+          await this.loadReports();
+          this.pollStatus();
+        },
+
+        async loadConfig() {
+          const res = await fetch('/api/config');
+          this.config = await res.json();
+        },
+
+        async saveConfig() {
+          const res = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(this.config),
+          });
+          if (res.ok) {
+            this.configMsg = '已保存';
+            setTimeout(() => this.configMsg = '', 2000);
+          }
+        },
+
+        async previewColumn() {
+          this.previewList = [];
+          try {
+            const res = await fetch('/api/column-preview', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: this.config.column_url }),
+            });
+            const data = await res.json();
+            if (data.error) { alert(data.error); return; }
+            this.previewList = data;
+          } catch (e) { alert('预览失败: ' + e.message); }
+        },
+
+        async collectAll() {
+          await fetch('/api/collect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+          });
+          this.startPolling();
+        },
+
+        async collectOne(url) {
+          await fetch('/api/collect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ report_url: url }),
+          });
+          this.startPolling();
+        },
+
+        startPolling() {
+          if (this._pollTimer) return;
+          this._pollTimer = setInterval(() => this.pollStatus(), 1500);
+        },
+
+        async pollStatus() {
+          const res = await fetch('/api/status');
+          const prev = this.status.running;
+          this.status = await res.json();
+          // 自动滚动日志
+          this.$nextTick(() => {
+            if (this.$refs.logBox) this.$refs.logBox.scrollTop = this.$refs.logBox.scrollHeight;
+          });
+          // 任务结束时停止轮询并刷新报告
+          if (prev && !this.status.running) {
+            clearInterval(this._pollTimer);
+            this._pollTimer = null;
+            await this.loadReports();
+          }
+          // 任务运行中确保轮询
+          if (this.status.running && !this._pollTimer) {
+            this.startPolling();
+          }
+        },
+
+        clearLog() {
+          this.status.log = [];
+        },
+
+        async loadReports() {
+          const res = await fetch('/api/reports');
+          const data = await res.json();
+          // 添加展开状态
+          data.forEach(y => { y._open = true; y.ranges.forEach(r => { r._open = false; r.leaders.forEach(l => { l._open = false; }); }); });
+          this.reports = data;
+        },
+      };
+    }
+  </script>
+</body>
+</html>
