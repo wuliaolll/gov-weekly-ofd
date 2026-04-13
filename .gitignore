@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Generated files
+test_output/
+output/
+*.log
+*.pid
+debug.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+test/
+*.db

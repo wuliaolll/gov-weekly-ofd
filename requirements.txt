@@ -1,0 +1,8 @@
+flask==3.1.1
+requests==2.32.3
+beautifulsoup4==4.13.4
+lxml==5.4.0
+python-docx==1.1.2
+reportlab==4.4.0
+easyofd==0.5.6
+apscheduler==3.11.0
