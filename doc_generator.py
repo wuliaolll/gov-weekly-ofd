@@ -8,6 +8,8 @@ import os
 import re
 from pathlib import Path
 
+from docx.oxml import OxmlElement
+
 from docx import Document
 from docx.shared import Pt, Cm, Emu
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -23,11 +25,23 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 
 # ============ 字体注册 ============
 
-# Windows 字体路径（系统目录 + 用户目录）
-_FONT_DIRS = [
-    Path("C:/Windows/Fonts"),
-    Path.home() / "AppData/Local/Microsoft/Windows/Fonts",
-]
+import platform as _platform
+
+# 字体搜索路径（跨平台）
+if _platform.system() == "Windows":
+    _FONT_DIRS = [
+        Path("C:/Windows/Fonts"),
+        Path.home() / "AppData/Local/Microsoft/Windows/Fonts",
+    ]
+else:
+    # Linux / macOS — 常见系统字体目录 + 项目自带 fonts/ 目录
+    _FONT_DIRS = [
+        Path(__file__).parent / "fonts",
+        Path.home() / ".fonts",
+        Path("/usr/share/fonts"),
+        Path("/usr/share/fonts/truetype"),
+        Path("/usr/local/share/fonts"),
+    ]
 
 
 def _find_font(candidates: list[str]) -> str | None:
@@ -71,6 +85,295 @@ def _register_reportlab_fonts():
     _fonts_registered = True
 
 
+# ============ 标题智能折行 ============
+
+# 版心宽度: 21cm - 3.2cm - 3.2cm = 14.6cm; 标题 22pt，每 CJK 字符约 22pt 宽
+# 14.6cm ≈ 414pt → 414/22 ≈ 18.8; 实测 Word 中 18 个全角字符刚好一行
+_TITLE_MAX_CHARS = 18.0
+
+
+def _char_width(ch: str) -> float:
+    """CJK 全角 = 1，ASCII 半角 ≈ 0.5"""
+    return 0.5 if ord(ch) < 128 else 1.0
+
+
+def _text_width(s: str) -> float:
+    return sum(_char_width(c) for c in s)
+
+
+def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[str]:
+    """基于语义断点的标题智能折行。
+
+    1. jieba 分词 + 词性标注，合并短语原子单元
+    2. 识别从句边界（动宾短语完成处）给予奖励
+    3. 用 DP 在词边界处寻找语义最优的分行方案
+       - 评分 = 断点语义惩罚之和（越低越好）
+       - 轻微均匀性偏好作为 tiebreaker
+    """
+    total = _text_width(title)
+    if total <= max_width:
+        return [title.replace(' ', '').replace('\u3000', '')]
+
+    # --- 空格分隔的标题：直接按空格拆分短语，再合并成最少行 ---
+    if ' ' in title or '\u3000' in title:
+        import re as _re
+        segments = [s for s in _re.split(r'[ \u3000]+', title) if s]
+        # 所有片段都不超宽才走快速路径
+        if all(_text_width(s) <= max_width for s in segments):
+            import math as _m
+            n_seg = len(segments)
+            seg_widths = [_text_width(s) for s in segments]
+            min_lines = _m.ceil(sum(seg_widths) / max_width)
+            # DP: dp[i] = (min_lines, min_max_deviation, break_points) 前 i 个片段
+            _INF = float('inf')
+            dp = [(_INF, _INF, [])] * (n_seg + 1)
+            dp[0] = (0, 0.0, [])
+            for i in range(1, n_seg + 1):
+                for j in range(i):
+                    # segments[j..i-1] 合成一行
+                    line_w = sum(seg_widths[j:i])
+                    if line_w > max_width:
+                        continue
+                    prev_lines, prev_dev, prev_bps = dp[j]
+                    new_lines = prev_lines + 1
+                    new_dev = prev_dev + line_w  # 临时存总宽，最后算方差
+                    if new_lines < dp[i][0] or (new_lines == dp[i][0]):
+                        # 需要比较方差
+                        pass
+                    dp_candidate = (new_lines, prev_bps + [i])
+                    # 简化：先找最少行方案，再在最少行方案中选最均匀的
+                    pass
+            # 简化实现：枚举所有分行方案（片段数通常 ≤5）
+            best_lines = None
+            best_score = (_INF, _INF)
+            def _try_partition(seg_idx, current_lines):
+                nonlocal best_lines, best_score
+                if seg_idx == n_seg:
+                    n = len(current_lines)
+                    if n == 0:
+                        return
+                    widths = [_text_width(l) for l in current_lines]
+                    mean_w = sum(widths) / n
+                    variance = sum((w - mean_w) ** 2 for w in widths)
+                    score = (n, variance)
+                    if score < best_score:
+                        best_score = score
+                        best_lines = list(current_lines)
+                    return
+                for end in range(seg_idx + 1, n_seg + 1):
+                    line = ' '.join(segments[seg_idx:end])
+                    if _text_width(line) > max_width:
+                        break
+                    current_lines.append(line)
+                    _try_partition(end, current_lines)
+                    current_lines.pop()
+            _try_partition(0, [])
+            if best_lines:
+                return best_lines
+        # 片段超宽，回退到下面的完整算法（去掉空格）
+        title = ''.join(segments)
+        total = _text_width(title)
+    else:
+        # 无空格标题，跳过空格相关处理
+        pass
+
+    # 无空格标题 — 原始空格位置不再需要
+    space_positions = set()
+
+    import math
+    import jieba
+    import jieba.posseg as pseg
+
+    # 注册政务文本常见复合词，避免被拆分
+    for cw in ('科技创新', '产业创新', '城市更新', '融合发展',
+               '高质量发展', '春季学期', '秋季学期',
+               '营商环境', '经济社会', '投融资',
+               '城建领域', '体制改革', '专题会议', '常务会议',
+               '深入推进', '扎实推进', '统筹推进', '科学务实'):
+        jieba.add_word(cw)
+
+    # 词性标注
+    word_pos_list = list(pseg.cut(title))
+    words = [w for w, _ in word_pos_list]
+    flags = [f for _, f in word_pos_list]
+
+    # ---- Phase 1: 短语合并 ----
+    _MOD_POS = {'a', 'ad', 'd', 'vd'}
+    merged_words = []
+    merged_flags = []
+    i = 0
+    while i < len(words):
+        # 短修饰词(≤2) + 短动词(≤2) → 复合动词 (牢固+树立, 坚定+践行)
+        if (i + 1 < len(words)
+                and len(words[i]) <= 2 and len(words[i + 1]) <= 2
+                and flags[i] in _MOD_POS
+                and flags[i + 1].startswith('v')):
+            merged_words.append(words[i] + words[i + 1])
+            merged_flags.append(flags[i + 1])
+            i += 2
+        # 短内容词(≤2) + 短修饰词(≤2) → 并列修饰语 (科学+务实)
+        # 排除：前一个词是动词（说明当前词是宾语，不应与后面合并）
+        elif (i + 1 < len(words)
+              and len(words[i]) <= 2 and len(words[i + 1]) <= 2
+              and flags[i] in {'n', 'a', 'ad', 'vn'}
+              and flags[i + 1] in _MOD_POS
+              and not (i > 0 and flags[i - 1].startswith('v'))):
+            merged_words.append(words[i] + words[i + 1])
+            merged_flags.append(flags[i])
+            i += 2
+        else:
+            merged_words.append(words[i])
+            merged_flags.append(flags[i])
+            i += 1
+
+    words = merged_words
+    flags = merged_flags
+
+    # ---- Phase 2: 为每个词边界计算语义断点分数 ----
+    _NOUN_POS = {'n', 'vn', 'ns', 'nt', 'nz', 'l'}
+    _STICKY_POS = {'d', 'a', 'ad', 'p', 'c', 'f', 'r', 'm', 'q', 'vd'}
+
+    break_positions = []  # [(char_pos, penalty)]
+    pos = 0
+    for i, w in enumerate(words):
+        pos += len(w)
+        if i < len(words) - 1:
+            flag_i = flags[i]
+            flag_next = flags[i + 1]
+            penalty = 0.0
+
+            # --- 原始空格位置是优质断点（标题中空格表示短语分隔） ---
+            if pos in space_positions:
+                penalty -= 15.0
+
+            # --- 从句边界奖励 ---
+            # 名词完成动宾短语（前面近处有动词），后面开始新动词短语
+            # 单字名词如"时""上"太短，不足以标识从句边界
+            if flag_i in _NOUN_POS and len(w) >= 2:
+                has_verb_before = any(
+                    flags[j].startswith('v')
+                    for j in range(max(0, i - 4), i)
+                )
+                if has_verb_before:
+                    starts_new = False
+                    if flag_next.startswith('v'):
+                        starts_new = True
+                    elif flag_next in _MOD_POS:
+                        for j in range(i + 2, min(i + 5, len(words))):
+                            if flags[j].startswith('v'):
+                                starts_new = True
+                                break
+                            if flags[j] not in _MOD_POS | {'n'}:
+                                break
+                    if starts_new:
+                        # 前一个词是副词(d) → 在修饰链内（如"更加 科学务实 推动"），
+                        # 不是真正的从句边界，不给奖励
+                        if not (i > 0 and flags[i - 1] == 'd'):
+                            penalty -= 15.0
+
+            # --- 惩罚：不良断点 ---
+            # 修饰/功能词做行尾
+            if flag_i in _STICKY_POS:
+                penalty += 12.0
+            # 单字功能词做行尾
+            if len(w) == 1 and flag_i in {'c', 'p', 'u', 'f', 'r'}:
+                penalty += 8.0
+            # 动词后跟它的修饰词/宾语，不宜拆开（如"踐行正确政绩观")
+            if flag_i.startswith('v') and flag_i != 'vn':
+                if flag_next in _NOUN_POS | {'ad', 'a'}:
+                    penalty += 5.0
+            # 连续短动词（复合动词）
+            if (flag_i.startswith('v') and flag_next.startswith('v')
+                    and len(w) <= 2 and len(words[i + 1]) <= 2):
+                penalty += 5.0
+
+            break_positions.append((pos, penalty))
+
+    # ---- Phase 3: DP 搜索最优分行 ----
+    n_lines = math.ceil(total / max_width)
+    INF = float("inf")
+
+    best_result = None
+    best_score = INF
+
+    # 只尝试最少行数和多一行（多一行可利用更多从句边界）
+    for target_n in range(n_lines, min(n_lines + 2, len(words) + 1)):
+        if target_n < 1:
+            continue
+        target_w = total / target_n
+        extra_line_penalty = (target_n - n_lines) * 6.0
+
+        def search(start_idx: int, lines_left: int, memo: dict,
+                   _tw: float = target_w) -> tuple:
+            key = (start_idx, lines_left)
+            if key in memo:
+                return memo[key]
+
+            rw = _text_width(title[start_idx:])
+
+            if lines_left == 1:
+                if rw <= max_width:
+                    # 轻微均匀性 + 过短行惩罚
+                    score = 0.15 * (rw - _tw) ** 2 + max(0, 5 - rw) * 2.0
+                    memo[key] = (score, [])
+                else:
+                    memo[key] = (INF, [])
+                return memo[key]
+
+            best_s = INF
+            best_bp = []
+
+            for bp, bp_penalty in break_positions:
+                if bp <= start_idx:
+                    continue
+                line_w = _text_width(title[start_idx:bp])
+                if line_w > max_width:
+                    break
+                if line_w < 3:
+                    continue
+
+                # 轻微均匀性 + 过短行惩罚
+                line_score = 0.15 * (line_w - _tw) ** 2 + max(0, 5 - line_w) * 2.0
+
+                sub_score, sub_bps = search(bp, lines_left - 1, memo)
+                if sub_score >= INF:
+                    continue
+                score = bp_penalty + line_score + sub_score
+                if score < best_s:
+                    best_s = score
+                    best_bp = [bp] + sub_bps
+
+            memo[key] = (best_s, best_bp)
+            return memo[key]
+
+        score, bps = search(0, target_n, {})
+        score += extra_line_penalty
+        if score < best_score:
+            best_score = score
+            best_result = bps
+
+    if not best_result:
+        # 兜底：按词语贪心填充
+        lines, cur = [], ""
+        for w in words:
+            if _text_width(cur + w) > max_width and cur:
+                lines.append(cur)
+                cur = w
+            else:
+                cur += w
+        if cur:
+            lines.append(cur)
+        return lines
+
+    lines = []
+    prev = 0
+    for bp in best_result:
+        lines.append(title[prev:bp])
+        prev = bp
+    lines.append(title[prev:])
+    return lines
+
+
 # ============ DOCX 生成 ============
 
 def generate_docx(title: str, content: str, output_path: str, paragraphs: list[dict] | None = None):
@@ -99,22 +402,30 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
     if doc.paragraphs:
         doc.paragraphs[0].clear()
 
-    # 第一行空行（标题在第二行）
-    blank = doc.add_paragraph()
-    blank.paragraph_format.space_before = Pt(0)
-    blank.paragraph_format.space_after = Pt(0)
-    _set_line_spacing_fixed(blank, 32)
-
-    # 标题
+    # 标题（智能折行：每行是完整分词/短句）
     title_para = doc.add_paragraph()
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _set_line_spacing_fixed(title_para, 32)
     title_para.paragraph_format.space_before = Pt(0)
     title_para.paragraph_format.space_after = Pt(0)
-    title_run = title_para.add_run(title)
-    title_run.font.size = Pt(22)  # 二号
-    _set_font_name(title_run, "方正小标宋简体", "FZXiaoBiaoSong")
-    title_run.font.color.rgb = None  # 黑色
+
+    title_lines = _smart_title_lines(title)
+    for i, line in enumerate(title_lines):
+        # 拆分中文和英文/数字，分别设置字体
+        segments = _split_cn_en(line)
+        for text, is_ascii in segments:
+            title_run = title_para.add_run(text)
+            title_run.font.size = Pt(22)  # 二号
+            if is_ascii:
+                _set_font_name(title_run, "Times New Roman", "Times New Roman")
+            else:
+                _set_font_name(title_run, "方正小标宋简体", "FZXiaoBiaoSong")
+            title_run.font.color.rgb = None  # 黑色
+        if i < len(title_lines) - 1:
+            # 插入软换行（同段内换行）
+            br_run = title_para.add_run()
+            br_elem = OxmlElement("w:br")
+            br_run._element.append(br_elem)
 
     # 标题与正文间空一行
     spacer = doc.add_paragraph()
@@ -127,9 +438,17 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
         para_list = paragraphs
     else:
         para_list = [{"text": p.strip(), "align": "left"} for p in content.split("\n") if p.strip()]
+    prev_align_docx = None
     for para_info in para_list:
         para_text = para_info["text"] if isinstance(para_info, dict) else para_info
         para_align = para_info.get("align", "left") if isinstance(para_info, dict) else "left"
+
+        # 居中段落后接正文时插入空行
+        if prev_align_docx == "center" and para_align != "center":
+            sp = doc.add_paragraph()
+            sp.paragraph_format.space_before = Pt(0)
+            sp.paragraph_format.space_after = Pt(0)
+            _set_line_spacing_fixed(sp, 32)
 
         p = doc.add_paragraph()
         if para_align == "center":
@@ -137,7 +456,7 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
             p.paragraph_format.first_line_indent = Pt(0)
         else:
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.first_line_indent = Pt(18 * 2)  # 首行缩进2个字符（小二号=18pt）
+            _set_first_line_indent_chars(p, 2)  # 严格2字符缩进
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0)
         _set_line_spacing_fixed(p, 32)
@@ -153,6 +472,8 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
                 _set_font_name(run, "仿宋_GB2312", "FangSong_GB2312")
             run.font.bold = False
             run.font.color.rgb = None  # 黑色
+
+        prev_align_docx = para_align
 
     doc.save(output_path)
 
@@ -186,6 +507,19 @@ def _set_font_name(run, cn_name: str, en_name: str):
     rFonts.set(qn("w:cs"), en_name)
 
 
+def _set_first_line_indent_chars(paragraph, chars: int):
+    """用 OOXML w:firstLineChars 严格设置首行缩进字符数（Word「2字符」缩进标准写法）"""
+    pPr = paragraph._element.get_or_add_pPr()
+    ind = pPr.find(qn("w:ind"))
+    if ind is None:
+        ind = pPr.makeelement(qn("w:ind"), {})
+        pPr.append(ind)
+    # w:firstLineChars 单位: 1/100 字符，2字符 = 200
+    ind.set(qn("w:firstLineChars"), str(chars * 100))
+    # w:firstLine 单位: twips（1/20 pt），18pt * 2 = 36pt = 720 twips（作为回退值）
+    ind.set(qn("w:firstLine"), str(int(18 * 2 * 20)))
+
+
 def _split_cn_en(text: str) -> list[tuple[str, bool]]:
     """将文本拆分为中文段和ASCII段"""
     segments = []
@@ -217,15 +551,21 @@ def _split_cn_en(text: str) -> list[tuple[str, bool]]:
 def _rl_mixed_font_text(text: str, cn_font: str, en_font: str | None) -> str:
     """为 ReportLab Paragraph 生成混合字体的 XML 标记文本。
     中文部分用 cn_font，ASCII 数字/字母部分用 en_font。
+    在中西文边界插入一个 TNR 空格，模拟 Word「调整中西文间距」行为。
     文本需先经过 _xml_escape。"""
     if not en_font:
         return _xml_escape(text)
     segments = _split_cn_en(text)
     parts = []
-    for seg_text, is_ascii in segments:
+    for i, (seg_text, is_ascii) in enumerate(segments):
         safe = _xml_escape(seg_text)
         if is_ascii:
-            parts.append(f'<font name="{en_font}">{safe}</font>')
+            prev_is_cjk = i > 0 and not segments[i - 1][1]
+            next_is_cjk = i < len(segments) - 1 and not segments[i + 1][1]
+            # 前有 CJK → 插入一个 TNR 空格（约 1/4 em），模拟中西文间距
+            prefix = f'<font name="{en_font}"> </font>' if prev_is_cjk else ""
+            suffix = f'<font name="{en_font}"> </font>' if next_is_cjk else ""
+            parts.append(f'{prefix}<font name="{en_font}">{safe}</font>{suffix}')
         else:
             parts.append(safe)
     return ''.join(parts)
@@ -271,7 +611,7 @@ def generate_ofd(title: str, content: str, output_path: str, paragraphs: list[di
         fontSize=18,
         leading=32,
         alignment=TA_JUSTIFY,
-        firstLineIndent=18 * 2,
+        firstLineIndent=18 * 2,  # 严格 2 字符：CJK 全角宽 = fontSize，2字符 = 36pt
         textColor="black",
         spaceAfter=0,
         spaceBefore=0,
@@ -291,12 +631,12 @@ def generate_ofd(title: str, content: str, output_path: str, paragraphs: list[di
 
     story = []
 
-    # 第一行空白（标题在第二行）
-    story.append(Spacer(1, 32))
-
-    # 标题
+    # 标题（智能折行）
     en_font = "TimesNewRoman" if TNR_PATH else None
-    safe_title = _rl_mixed_font_text(title, title_font, en_font)
+    title_lines = _smart_title_lines(title)
+    safe_title = "<br/>".join(
+        _rl_mixed_font_text(line, title_font, en_font) for line in title_lines
+    )
     story.append(Paragraph(safe_title, title_style))
 
     # 标题与正文间空一行
@@ -321,12 +661,17 @@ def generate_ofd(title: str, content: str, output_path: str, paragraphs: list[di
         para_list = paragraphs
     else:
         para_list = [{"text": p.strip(), "align": "left"} for p in content.split("\n") if p.strip()]
+    prev_align = None
     for para_info in para_list:
         para_text = para_info["text"] if isinstance(para_info, dict) else para_info
         para_align = para_info.get("align", "left") if isinstance(para_info, dict) else "left"
+        # 居中段落后接正文段落时，插入一个空行
+        if prev_align == "center" and para_align != "center":
+            story.append(Spacer(1, 32))
         safe_text = _rl_mixed_font_text(para_text, body_font, en_font)
         style = center_body_style if para_align == "center" else body_style
         story.append(Paragraph(safe_text, style))
+        prev_align = para_align
 
     doc.build(story)
 
@@ -346,266 +691,11 @@ def _xml_escape(text: str) -> str:
     )
 
 
-def _is_wide_char(ch):
-    """判断字符是否为全角（CJK、全角标点等）"""
-    cp = ord(ch)
-    # CJK统一汉字、CJK扩展、全角标点、中文标点等
-    if cp >= 0x4E00 and cp <= 0x9FFF: return True
-    if cp >= 0x3400 and cp <= 0x4DBF: return True
-    if cp >= 0x3000 and cp <= 0x303F: return True  # CJK标点
-    if cp >= 0xFF01 and cp <= 0xFF60: return True  # 全角ASCII
-    if cp >= 0x2000 and cp <= 0x206F: return True  # 通用标点（中文逗号句号等）
-    if cp >= 0x2018 and cp <= 0x201F: return True  # 引号
-    if cp >= 0xFE30 and cp <= 0xFE4F: return True  # CJK兼容
-    if cp >= 0x20000 and cp <= 0x2A6DF: return True  # CJK扩展B
-    return False
-
-
-def _calc_delta_x(text, total_length, font_size_mm):
-    """计算每个字符的 DeltaX，CJK字符宽度约=font_size，ASCII约=font_size*0.5"""
-    if len(text) <= 1:
-        return "0"
-    # 估算每个字符的理论宽度
-    widths = []
-    for ch in text:
-        if _is_wide_char(ch):
-            widths.append(font_size_mm)  # 全角
-        else:
-            widths.append(font_size_mm * 0.5)  # 半角
-    # 按比例缩放到实际总宽度
-    est_total = sum(widths)
-    if est_total > 0:
-        scale = total_length / est_total
-        widths = [w * scale for w in widths]
-    else:
-        widths = [total_length / len(text)] * len(text)
-    # DeltaX 是从第 1 个字符到第 n-1 个字符的步进值（共 n-1 个值）
-    # 第 i 个 DeltaX = 第 i 个字符的宽度（从第 i 个字符起点到第 i+1 个字符起点）
-    deltas = [f"{widths[i]:.4f}" for i in range(len(text) - 1)]
-    return " ".join(deltas)
-
-
-def _build_content_res_fixed(ofd_writer, pdf_info_list, id_obj, pfd_res_uuid_map):
-    """替代 build_content_res，修复 DeltaX 均匀分配和文本颜色问题"""
-    from easyofd.draw.draw_ofd import ContentTemplate
-    content_res_list = []
-    for idx, content in enumerate(pdf_info_list):
-        ImageObject = []
-        TextObject = []
-        PhysicalBox = pfd_res_uuid_map["other"]["page_size"][idx]
-        PhysicalBox = f"0 0 {PhysicalBox[0]} {PhysicalBox[1]}"
-        for block in content:
-            bbox = block['bbox']
-            OP = ofd_writer.OP
-            x0 = bbox[0] / OP
-            y0 = bbox[1] / OP
-            length = (bbox[2] - bbox[0]) / OP
-            height = (bbox[3] - bbox[1]) / OP
-            if block["type"] == "text":
-                text = block.get("text")
-                count = len(text)
-                font_size_mm = block.get("size") / OP
-                delta_x = _calc_delta_x(text, length, font_size_mm)
-                TextObject.append({
-                    "@ID": 0,
-                    "res_uuid": block.get("res_uuid"),
-                    "@Font": "",
-                    "ofd:FillColor": {"Value": "0 0 0"},  # 黑色文字
-                    "ofd:TextCode": {
-                        "#text": text,
-                        "@X": "0",
-                        "@Y": f"{font_size_mm}",
-                        "@DeltaX": delta_x
-                    },
-                    "@size": font_size_mm,
-                    "@Boundary": f"{x0} {y0} {length} {height}",
-                })
-            elif block["type"] == "img":
-                ImageObject.append({
-                    "@ID": 0,
-                    "res_uuid": block.get("res_uuid"),
-                    "@Boundary": f"{x0} {y0} {length} {height}",
-                    "@ResourceID": ""
-                })
-        conten = ContentTemplate(PhysicalBox=PhysicalBox, ImageObject=ImageObject,
-                                 CGTransform=[], PathObject=[], TextObject=TextObject, id_obj=id_obj)
-        content_res_list.append(conten)
-    return content_res_list
-
-
 def _pdf_to_ofd(pdf_bytes: bytes, output_path: str):
-    """用 easyofd 将 PDF 转为 OFD"""
-    import tempfile
-    import shutil
-    try:
-        from easyofd.ofd import OFD
-    except ImportError as e:
-        import sys
-        raise ImportError(
-            f"easyofd 模块导入失败: {e}\n"
-            f"当前 Python: {sys.executable}\n"
-            f"请确保使用 venv 环境运行: .venv\\Scripts\\python.exe app.py"
-        ) from e
-
-    # monkey-patch easyofd 修复 optional_text 模式下 Document PhysicalBox 不正确的 bug
-    from easyofd.draw.draw_ofd import OFDWrite
-    _orig_call = OFDWrite.__call__
-
-    def _patched_call(self, pdf_bytes=None, pil_img_list=None, optional_text=False):
-        if optional_text and pdf_bytes:
-            from easyofd.draw.pdf_parse import DPFParser
-            from easyofd.draw.draw_ofd import CurId
-
-            # monkey-patch PDF 解析器，修复 span bbox 使用行 bbox 的 bug
-            import easyofd.draw.pdf_parse as _pdf_parse_mod
-            _orig_extract = DPFParser.extract_text_with_details
-
-            def _fixed_extract(self_parser, pdf_bytes_inner):
-                """修复: 使用 span['bbox'] 替代 line_rect，使每个文字段有独立定位"""
-                import fitz
-                import io as _io
-                from uuid import uuid1
-                details_list = []
-                pdf_stream = _io.BytesIO(pdf_bytes_inner)
-                with fitz.open(stream=pdf_stream, filetype="pdf") as doc:
-                    res_uuid_map = {"img": {}, "font": {}, "other": {}}
-                    for page_num in range(len(doc)):
-                        page_details = []
-                        page = doc.load_page(page_num)
-                        rect = page.rect
-                        if res_uuid_map["other"].get("page_size"):
-                            res_uuid_map["other"]["page_size"][page_num] = [rect.width, rect.height]
-                        else:
-                            res_uuid_map["other"]["page_size"] = {page_num: [rect.width, rect.height]}
-                        blocks = page.get_text("dict").get("blocks", [])
-                        image_list = page.get_images(full=True)
-                        for block in blocks:
-                            for line in block.get("lines", []):
-                                line_bbox = line["bbox"]
-                                for span in line.get("spans", []):
-                                    span_text = span.get("text", "")
-                                    if not span_text:
-                                        continue
-                                    font_name = span.get("font", "")
-                                    font_size = span.get("size")
-                                    font_color = span.get("color")
-                                    # 使用 span bbox 的 x 坐标（精确水平定位），
-                                    # 但使用 line bbox 的 y 坐标（基线对齐）
-                                    span_bbox = span.get("bbox", line_bbox)
-                                    aligned_bbox = [span_bbox[0], line_bbox[1], span_bbox[2], line_bbox[3]]
-                                    # 维护 font uuid map
-                                    if font_name not in res_uuid_map["font"].values():
-                                        res_uuid = str(uuid1())
-                                        res_uuid_map["font"][res_uuid] = font_name
-                                    else:
-                                        vs = list(res_uuid_map["font"].values())
-                                        ks = list(res_uuid_map["font"].keys())
-                                        res_uuid = ks[vs.index(font_name)]
-                                    page_details.append({
-                                        "page": page_num, "text": span_text,
-                                        "font": font_name, "res_uuid": res_uuid,
-                                        "size": font_size, "color": font_color,
-                                        "bbox": aligned_bbox, "type": "text"
-                                    })
-                        # 处理图片
-                        for img_info in image_list:
-                            xref = img_info[0]
-                            try:
-                                base_image = doc.extract_image(xref)
-                                if base_image:
-                                    img_bytes = base_image["image"]
-                                    img_uuid = str(uuid1())
-                                    res_uuid_map["img"][img_uuid] = _io.BytesIO(img_bytes)
-                                    page_details.append({
-                                        "type": "img", "res_uuid": img_uuid,
-                                        "bbox": [0, 0, rect.width, rect.height]
-                                    })
-                            except Exception:
-                                pass
-                        details_list.append(page_details)
-                return details_list, res_uuid_map
-
-            DPFParser.extract_text_with_details = _fixed_extract
-
-            pdf_obj = DPFParser()
-            pdf_info_list, pfd_res_uuid_map = pdf_obj.extract_text_with_details(pdf_bytes)
-
-            # 恢复原始方法
-            DPFParser.extract_text_with_details = _orig_extract
-
-            # 修复字体名称：将 PostScript 名映射为 OFD 查看器能识别的友好名称
-            _font_name_map = {
-                "FZXBSJW--GB1-0": "方正小标宋简体",
-                "FangSong_GB2312": "仿宋_GB2312",
-                "FangSong": "仿宋",
-                "TimesNewRomanPSMT": "Times New Roman",
-                "TimesNewRomanPS-BoldMT": "Times New Roman",
-            }
-            font_map = pfd_res_uuid_map.get("font", {})
-            for uuid_key, ps_name in list(font_map.items()):
-                if ps_name in _font_name_map:
-                    font_map[uuid_key] = _font_name_map[ps_name]
-
-            id_obj = CurId()
-
-            # 修复 easyofd bug: OP=200/25.4 用于 200DPI 图片转 mm，
-            # 但 PDF 文本坐标是 72DPI(points)，正确因子应为 72/25.4
-            orig_op = self.OP
-            self.OP = 72.0 / 25.4  # points → mm 的正确转换因子
-
-            # 修复文本 bbox 高度不足：PDF bbox 是 tight bbox，需要扩展以容纳行距
-            for page_blocks in pdf_info_list:
-                for block in page_blocks:
-                    if block.get("type") == "text":
-                        bbox = block["bbox"]
-                        font_size = block.get("size", 0)
-                        extra = font_size * 0.4
-                        block["bbox"] = (bbox[0], bbox[1] - extra * 0.3, bbox[2], bbox[3] + extra * 0.7)
-
-            # page_size 在 build_content_res 中直接使用（不除以 OP），需要手动转为 mm
-            page_sizes = pfd_res_uuid_map.get("other", {}).get("page_size", {})
-            for pg_idx in page_sizes:
-                page_sizes[pg_idx] = [page_sizes[pg_idx][0] / self.OP, page_sizes[pg_idx][1] / self.OP]
-            if page_sizes:
-                first_size = page_sizes[0]
-                phys_box = f"0 0 {first_size[0]:.2f} {first_size[1]:.2f}"
-            else:
-                phys_box = "0 0 210 297"  # A4 mm fallback
-            ofd_entrance = self.build_ofd_entrance(id_obj=id_obj)
-            document = self.build_document(len(pdf_info_list), id_obj=id_obj, PhysicalBox=phys_box)
-            public_res = self.build_public_res(id_obj=id_obj, pfd_res_uuid_map=pfd_res_uuid_map)
-            document_res = self.build_document_res(len(pdf_info_list), id_obj=id_obj, pfd_res_uuid_map=pfd_res_uuid_map)
-            content_res_list = _build_content_res_fixed(self, pdf_info_list=pdf_info_list, id_obj=id_obj,
-                                                         pfd_res_uuid_map=pfd_res_uuid_map)
-            self.OP = orig_op  # 恢复原始 OP
-
-            res_static = {}
-            img_dict = pfd_res_uuid_map.get("img")
-            if img_dict:
-                for key, v_io in img_dict.items():
-                    res_static[f"Image_{key}.jpg"] = v_io.getvalue()
-            from easyofd.draw.draw_ofd import OFDStructure
-            ofd_byte = OFDStructure("123", ofd=ofd_entrance, document=document, public_res=public_res,
-                                    document_res=document_res, content_res=content_res_list, res_static=res_static)(
-                test=True)
-            return ofd_byte
-        return _orig_call(self, pdf_bytes, pil_img_list, optional_text)
-
-    OFDWrite.__call__ = _patched_call
-
-    # easyofd 会在当前目录创建临时 ./test 文件夹，需要在临时目录中执行
-    original_cwd = os.getcwd()
-    tmp_dir = tempfile.mkdtemp(prefix="ofd_gen_")
-    try:
-        os.chdir(tmp_dir)
-        ofd = OFD()
-        ofd_bytes = ofd.pdf2ofd(pdf_bytes, optional_text=True)
-        ofd.del_data()
-    finally:
-        os.chdir(original_cwd)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        OFDWrite.__call__ = _orig_call  # 恢复原始方法
-
+    """用 pdf2ofd skill 的 PDF2OFDConverter 将 PDF 转为 OFD（字符级精度）"""
+    from pdf2ofd import PDF2OFDConverter
+    converter = PDF2OFDConverter()
+    ofd_bytes = converter.convert(pdf_bytes)
     with open(output_path, "wb") as f:
         f.write(ofd_bytes)
 

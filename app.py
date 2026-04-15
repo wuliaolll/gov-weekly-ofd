@@ -172,8 +172,13 @@ def do_collect_and_generate(column_url: str, report_url: str = None):
                         _add_log(f"  文章内容为空，跳过")
                         continue
 
-                    # 构建输出路径
-                    title_safe = safe_filename(article["title"] or activity["summary"][:60])
+                    # 构建输出路径：文件名 = 领导姓名 + 概览标题
+                    overview_title = activity.get("overview_title", "")
+                    if overview_title:
+                        file_title = leader + overview_title
+                    else:
+                        file_title = article["title"] or activity["summary"][:60]
+                    title_safe = safe_filename(file_title)
                     out_dir = OUTPUT_DIR / year_dir / range_dir / leader_dir / safe_filename(date_str)
                     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -327,6 +332,33 @@ def download(filepath):
     return send_file(full_path, as_attachment=True)
 
 
+@app.route("/api/download-zip/<path:period_path>")
+def download_zip(period_path):
+    """打包下载某期全部文件，zip 内目录与生成目录保持一致"""
+    import zipfile
+    import io as _io
+
+    period_dir = OUTPUT_DIR / period_path
+    try:
+        period_dir.resolve().relative_to(OUTPUT_DIR.resolve())
+    except ValueError:
+        abort(403)
+    if not period_dir.exists() or not period_dir.is_dir():
+        abort(404)
+
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in sorted(period_dir.rglob("*")):
+            if not f.is_file() or f.suffix.lower() not in (".docx", ".ofd"):
+                continue
+            rel = f.relative_to(period_dir)
+            zf.write(f, str(rel).replace("\\", "/"))
+    buf.seek(0)
+
+    zip_name = safe_filename(period_path.replace("/", "_").replace("\\", "_")) + ".zip"
+    return send_file(buf, as_attachment=True, download_name=zip_name, mimetype="application/zip")
+
+
 @app.route("/api/column-preview", methods=["POST"])
 def column_preview():
     """预览栏目页解析结果"""
@@ -341,6 +373,73 @@ def column_preview():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/generate-article", methods=["POST"])
+def generate_article():
+    """针对单篇文章 URL 生成 DOCX + OFD，打包为 ZIP 下载"""
+    import zipfile
+    import io as _io
+    import tempfile
+
+    data = request.get_json() or {}
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "请提供文章URL"}), 400
+
+    # 基本 URL 校验
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "URL 必须以 http:// 或 https:// 开头"}), 400
+
+    try:
+        article = fetch_article_content(url)
+    except Exception as e:
+        return jsonify({"error": f"获取文章失败: {e}"}), 500
+
+    if not article.get("content"):
+        return jsonify({"error": "文章内容为空"}), 400
+
+    title = article.get("title") or "未命名文章"
+    title_safe = safe_filename(title)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        docx_path = os.path.join(tmpdir, f"{title_safe}.docx")
+        ofd_path = os.path.join(tmpdir, f"{title_safe}.ofd")
+
+        errors = []
+        try:
+            generate_docx(
+                title=title,
+                content=article["content"],
+                output_path=docx_path,
+                paragraphs=article.get("paragraphs"),
+            )
+        except Exception as e:
+            errors.append(f"DOCX: {e}")
+
+        try:
+            generate_ofd(
+                title=title,
+                content=article["content"],
+                output_path=ofd_path,
+                paragraphs=article.get("paragraphs"),
+            )
+        except Exception as e:
+            errors.append(f"OFD: {e}")
+
+        if not os.path.exists(docx_path) and not os.path.exists(ofd_path):
+            return jsonify({"error": f"生成失败: {'; '.join(errors)}"}), 500
+
+        buf = _io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            if os.path.exists(docx_path):
+                zf.write(docx_path, f"{title_safe}.docx")
+            if os.path.exists(ofd_path):
+                zf.write(ofd_path, f"{title_safe}.ofd")
+        buf.seek(0)
+
+        zip_name = f"{title_safe}.zip"
+        return send_file(buf, as_attachment=True, download_name=zip_name, mimetype="application/zip")
+
+
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -352,4 +451,6 @@ if __name__ == "__main__":
             minute=cfg.get("schedule_minute", 0),
         )
 
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host=host, port=port, debug=False)

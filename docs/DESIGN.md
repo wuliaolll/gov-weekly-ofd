@@ -1,180 +1,206 @@
-# 政务周报 OFD 生成器 — 技术方案
+# 政务周报 OFD 生成器 — 技术方案（现状版）
 
 ## 一、系统架构
 
 ```
-┌─────────────────────────────────────┐
-│           Web 前端 (浏览器)           │
-│   HTML + Tailwind CSS + Alpine.js    │
-└──────────────┬──────────────────────┘
-               │ HTTP API
-┌──────────────▼──────────────────────┐
-│         Flask 后端 (Python)          │
-│                                      │
-│  ┌──────────┐  ┌──────────────────┐ │
-│  │ 爬虫模块  │  │ 文档生成模块      │ │
-│  │scraper.py│  │doc_generator.py  │ │
-│  └─────┬────┘  └───┬──────────┬───┘ │
-│        │           │          │      │
-│        │     ┌─────▼──┐ ┌────▼───┐  │
-│        │     │python-  │ │Report- │  │
-│        │     │docx     │ │Lab PDF │  │
-│        │     │→ .docx  │ │→easyofd│  │
-│        │     └────────┘ │→ .ofd  │  │
-│        │                └────────┘  │
-│  ┌─────▼──────────────────────────┐ │
-│  │      APScheduler 定时任务       │ │
-│  └────────────────────────────────┘ │
-└──────────────────────────────────────┘
-               │
-     ┌─────────▼──────────┐
-     │   output/ 目录结构   │
-     │  年份/周报范围/领导/  │
-     │  日期/(.docx + .ofd) │
-     └────────────────────┘
+┌──────────────────────────────────────────────┐
+│                   Web 前端                   │
+│       templates/index.html + Alpine.js       │
+│      配置/预览/触发采集/状态/文件下载        │
+└───────────────────────┬──────────────────────┘
+                        │ HTTP API
+┌───────────────────────▼──────────────────────┐
+│                 Flask 后端（app.py）         │
+│                                              │
+│  配置管理  任务调度  任务线程  下载与打包     │
+│       │        │        │           │        │
+│       ▼        ▼        ▼           ▼        │
+│   config.json scheduler.py do_collect_and_generate
+│                           │                  │
+│                           ▼                  │
+│                      scraper.py              │
+│              (栏目页/周报页/正文页解析)      │
+│                           │                  │
+│                           ▼                  │
+│                    doc_generator.py          │
+│                   ├─ generate_docx           │
+│                   └─ generate_ofd            │
+│                          │                   │
+│                          ▼                   │
+│              ReportLab PDF + pdf2ofd.py      │
+│         (easyofd 增强补丁，字符级文本输出)    │
+└───────────────────────┬──────────────────────┘
+                        │
+                        ▼
+            output/门户网站周报/年/周期/领导/日期/
+                     同目录下 .docx + .ofd
 ```
 
-## 二、技术栈
+## 二、技术栈与依赖
 
-| 模块 | 技术 | 版本 | 用途 |
-|------|------|------|------|
-| Web框架 | Flask | 3.1.x | 后端API和页面路由 |
-| 爬虫 | requests + BeautifulSoup4 + lxml | latest | 解析政府网站HTML |
-| DOCX生成 | python-docx | 1.1.x | 按公文格式生成Word文档 |
-| PDF生成 | ReportLab | 4.4.x | 生成带矢量文本的PDF（中间产物）|
-| OFD转换 | easyofd | 0.5.x | PDF→OFD转换，保留可选中文本 |
-| 定时任务 | APScheduler | 3.11.x | 每日定时采集 |
-| 前端框架 | Tailwind CSS (CDN) + Alpine.js (CDN) | latest | 响应式UI + 交互 |
+| 模块 | 技术 | 说明 |
+|------|------|------|
+| Web 框架 | Flask 3.1.x | 页面路由与 API |
+| HTML 解析 | BeautifulSoup4 + lxml | 栏目页与详情页结构解析 |
+| 抓取方式 | `curl.exe` 子进程 | 规避 Python SSL 兼容问题 |
+| DOCX 生成 | python-docx | 公文排版输出 Word |
+| PDF 排版 | ReportLab | OFD 前置中间版式层 |
+| OFD 转换 | easyofd + 自定义补丁 | 由 `pdf2ofd.py` 注入增强能力 |
+| 中文分词 | jieba 0.42.1 | 标题智能折行（词性标注+语义断点） |
+| 定时任务 | APScheduler | 每日定时采集 |
+| 前端交互 | Tailwind CDN + Alpine.js | 轻量页面与实时状态刷新 |
 
-## 三、OFD 生成策略
+说明：`pdf2ofd.py` 依赖 PyMuPDF(`fitz`) 与 Pillow，用于高保真提取字符、路径和图像资源并写入 OFD 结构。
 
-**核心流程**: 文章正文 → ReportLab PDF（矢量文本） → easyofd pdf2ofd → OFD
+## 三、核心流程设计
 
-### 关键实现
+### 3.1 采集与生成流程
 
-```python
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from easyofd.ofd import OFD
+1. 前端调用 `POST /api/collect` 启动后台线程。
+2. 后端解析栏目列表，或按 `report_url` 处理指定周报。
+3. 解析周报详情，按日期分组并抽取领导活动。
+4. 对每条活动抓取详情正文，提取段落与对齐信息。
+5. 生成 DOCX 与 OFD，并落盘至统一目录结构。
+6. 前端轮询 `GET /api/status` 展示进度与日志。
 
-# 1. 用 ReportLab 生成公文排版 PDF
-c = canvas.Canvas(buffer, pagesize=A4)
-# ... 按公文格式排版 ...
-c.save()
+### 3.2 OFD 生成链路
 
-# 2. 用 easyofd 转换为 OFD
-ofd = OFD()
-ofd_bytes = ofd.pdf2ofd(pdf_bytes, optional_text=True)
-ofd.del_data()
-```
+当前实现链路：
 
-### 备选方案
+`正文段落 -> ReportLab PDF(矢量文本) -> PDF2OFDConverter(pdf2ofd.py) -> OFD`
 
-若 easyofd 转换效果不理想，可直接构建 OFD XML 包：
-- OFD 本质是 ZIP 文件，内含 XML（遵循 GB/T 33190-2016）
-- 手动构造 OFD.xml、Document.xml、Page XML、字体资源等
+关键点：
 
-## 四、字体方案
+1. `doc_generator.py` 负责公文版式、字体映射与中西文混排处理。
+2. 标题与正文均采用中英文混排：中文用对应字体（标题方正小标宋简体、正文仿宋GB2312），数字和英文字母统一用 Times New Roman。
+3. `pdf2ofd.py` 对 easyofd 进行 monkey patch：
+   - 提升文字定位精度（基于字符级坐标与 DeltaX）。
+   - 统一字体名称映射与资源组织。
+   - 修正路径/图形/图像转换细节。
+   - 生成标准 OFD ZIP 结构。
 
-系统已安装：
-- **方正小标宋简体** — 标题用
-- **仿宋GB2312** — 正文用
-- **Times New Roman** — 数字和英文
+### 3.3 标题智能折行
 
-ReportLab 中注册中文字体：
-```python
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+标题超过 18 个 CJK 字符宽度时，通过 `_smart_title_lines()` 进行语义折行：
 
-pdfmetrics.registerFont(TTFont('FZXiaoBiaoSong', 'C:/Windows/Fonts/FZXBSJW.TTF'))
-pdfmetrics.registerFont(TTFont('FangSong_GB2312', 'C:/Windows/Fonts/simfang.ttf'))
-```
+1. **空格分隔标题快速路径**：若标题含空格（如"张文兵强调拧紧责任链条 防范各类风险 切实筑牢安全发展防线"），先按空格拆为短语片段，再枚举合并方案取最少行+最均匀宽度的方案。合并后的行内保留原始空格。
+2. **无空格标题完整语义分析**：
+   - **jieba 分词 + 词性标注**：注册政务复合词（科技创新、高质量发展、营商环境等）避免误拆。
+   - **短语合并**：修饰词+动词（牢固+树立→牢固树立）、内容词+修饰词（科学+务实→科学务实）。
+   - **断点语义评分**：从句边界（动宾完成+新动词短语开始）给予 -15 奖励；粘连词性（副词/介词/连词等）+12 惩罚；动宾结构不拆 +5 惩罚。
+   - **DP 搜索**：以语义断点分数为主、行宽均匀性为辅，搜索最优分行方案。
 
-## 五、目录结构规范
+## 四、解析策略设计
+
+### 4.1 栏目页解析
+
+1. 入口 URL 默认：`https://www.hubei.gov.cn/hbfb/zwzb/index.shtml`。
+2. 选择器：`ul.hbgov-newslist-itemheight-18px li`。
+3. 输出字段：`title`、`url`、`pub_date`。
+
+### 4.2 周报页活动抽取
+
+1. 日期分隔：匹配 `X月X日`。
+2. 活动分隔：匹配 `^►+`。
+3. 领导识别：
+   - 独立领导名段落。
+   - 箭头后紧跟领导名。
+   - 领导名开头的活动标题行。
+4. 链接识别：`详情<<` 优先，同时兼容 `.shtml/.html`。
+
+### 4.3 正文页清洗
+
+1. 容器优先级：`.bt_content`、`#myText`、`.TRS_Editor`、`.article-content`、`.hbgov-article-content`。
+2. 过滤规则：编辑/责编/审核/来源、短署名、图解行。
+3. 保留段落对齐（居中/左对齐）给文档生成器。
+
+## 五、目录与文件设计
+
+### 5.1 输出目录
 
 ```
 output/门户网站周报/
 └── {年份}年/
-    └── {起始日期}-{结束日期}/
+    └── {周报日期范围}/
         └── {领导姓名}{职务}/
-            └── {活动月日}/
-                ├── {活动标题简称}.docx
-                └── {活动标题简称}.ofd
+            └── {活动日期}/
+                ├── {活动标题}.docx
+                └── {活动标题}.ofd
 ```
 
-文件名处理：
-- 最大长度 80 字符（避免路径过长）
-- 移除不安全文件名字符：`\ / : * ? " < > |`
+### 5.2 命名与安全
 
-## 六、API 设计
+1. 文件/目录名移除非法字符：`\\ / : * ? " < > |`。
+2. 文件名最大 80 字符。
+3. 下载接口使用路径归属校验，禁止目录穿越。
+
+### 5.3 打包下载规范
+
+1. 按“年份/周期”目录打包。
+2. zip 内结构与生成目录一致。
+3. 不再单独分 `docx/` 与 `ofd/` 顶层目录。
+
+## 六、API 设计（当前实现）
 
 | 方法 | 路径 | 功能 |
 |------|------|------|
 | GET | `/` | 主页面 |
 | GET | `/api/config` | 获取当前配置 |
 | POST | `/api/config` | 更新配置 |
-| GET | `/api/reports` | 获取已采集的周报列表 |
-| POST | `/api/collect` | 手动触发采集（可指定某一期） |
-| GET | `/api/reports/<id>/detail` | 获取某期周报解析详情 |
-| POST | `/api/generate/<id>` | 手动触发生成某期文件 |
-| GET | `/api/download/<path>` | 下载文件 |
-| GET | `/api/status` | 获取采集/生成任务状态 |
+| POST | `/api/column-preview` | 预览栏目解析结果 |
+| POST | `/api/collect` | 触发采集任务（可指定 `report_url`） |
+| GET | `/api/status` | 获取任务状态/进度/日志 |
+| GET | `/api/reports` | 获取输出文件树 |
+| GET | `/api/download/<path:filepath>` | 下载单个文件 |
+| GET | `/api/download-zip/<path:period_path>` | 打包下载某周期 |
 
-## 七、前端设计
+## 七、前端页面设计
 
-### 风格：红色公文风
+### 7.1 视觉与布局
 
-| 元素 | 设计值 |
-|------|--------|
-| 主色 | `#C41E24`（中国红）|
-| 辅色 | `#B8860B`（暗金/铜黄）|
-| 背景色 | `#FAFAF5`（暖米白）|
-| 文字色 | `#1A1A1A`（近黑）|
-| 次要文字 | `#6B7280`（灰色）|
-| 标题字体 | Noto Serif SC / 思源宋体 |
-| 正文字体 | Noto Sans SC / 思源黑体 |
-| 边框/分隔 | `#E5E2D9`（暖灰）|
-| 卡片背景 | `#FFFFFF` |
+1. 红色公文风配色：`#C41E24` 主色、`#B8860B` 辅色。
+2. 页面模块：
+   - 配置区（URL、定时、开关、保存、预览、全量采集）。
+   - 栏目预览区（按期触发）。
+   - 任务状态区（进度条+日志）。
+   - 文件树区（年份/周期/领导/日期展开，单文件与打包下载）。
 
-### 页面布局
+### 7.2 交互
 
-1. **顶部**: 红色横杠 + 标题（类公文红头）
-2. **配置区**: URL输入框 + 定时开关 + 手动采集按钮
-3. **周报列表**: 卡片式布局，每张显示日期范围、领导活动数、状态、下载
-4. **详情面板**: 点击展开查看该期所有领导动态和文件下载
+1. 任务启动后轮询状态（约 1.5s）。
+2. 任务结束自动刷新文件树。
+3. 状态日志自动滚动到底部。
 
-## 八、项目文件结构
+## 八、项目结构（当前）
 
 ```
 gov-weekly-ofd/
-├── app.py                  # Flask 主应用 + API路由
-├── scraper.py              # 网页爬虫解析模块
-├── doc_generator.py        # DOCX + OFD 文档生成
-├── scheduler.py            # APScheduler 定时任务
-├── config.json             # 用户配置
-├── requirements.txt        # Python 依赖
-├── docs/
-│   ├── REQUIREMENTS.md     # 需求文档
-│   └── DESIGN.md           # 本技术方案
-├── output/                 # 生成文件存放目录
-│   └── 门户网站周报/
-├── static/
-│   └── favicon.svg         # 图标
-├── templates/
-│   └── index.html          # 主页面
-└── fonts/                  # 字体文件备份（可选）
+├── app.py                  # Flask 主应用与 API
+├── scraper.py              # 采集与解析逻辑
+├── doc_generator.py        # DOCX/OFD 生成入口
+├── pdf2ofd.py              # easyofd 增强转换器
+├── scheduler.py            # 定时任务
+├── config.json             # 运行配置
+├── requirements.txt        # 依赖
+├── templates/index.html    # 前端页面
+├── static/                 # 静态资源
+├── docs/                   # 文档
+└── output/门户网站周报/    # 输出目录
 ```
 
-## 九、开发计划
+## 九、当前进展与后续计划
 
-| 阶段 | 内容 | 依赖 |
-|------|------|------|
-| P1 | 项目骨架 + 前端页面 | 无 |
-| P2 | 爬虫模块（栏目页 → 周报 → 活动 → 正文）| 无 |
-| P3 | DOCX 生成（python-docx 公文排版）| P2 |
-| P4 | OFD 生成（ReportLab PDF → easyofd OFD）| P2 |
-| P5 | 目录结构管理 + 文件组织 | P3, P4 |
-| P6 | 前后端串联（API + 前端交互）| P1, P5 |
-| P7 | 定时自动采集 | P6 |
-| P8 | 端到端测试 | 全部 |
-| P9 | Agent Skill 封装 | P8 |
+### 9.1 已完成
+
+1. 采集、解析、生成、下载闭环可运行。
+2. 周期打包下载已与生成目录结构对齐。
+3. OFD 转换已接入增强链路，优化文本可选中与版式精度。
+4. 标题智能折行：基于 jieba 分词与语义断点 DP 搜索，支持空格分隔标题快速路径。
+5. 标题中英文混排：DOCX 和 OFD 标题中的数字与英文字母均使用 Times New Roman 字体。
+
+### 9.2 下一步建议
+
+1. 将领导映射、过滤规则外置为可配置项。
+2. 完善 `requirements.txt` 与运行环境自检（含 `fitz`、`Pillow`）。
+3. 增加端到端回归测试与解析样本集。
+4. 引入任务历史持久化与失败重试。

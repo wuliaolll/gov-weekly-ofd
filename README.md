@@ -100,7 +100,8 @@ gov-weekly-ofd/
 ### doc_generator.py
 - 使用 python-docx 生成 DOCX
 - 使用 ReportLab + easyofd 生成 OFD
-- 支持字体混合，完美处理中文标点排版
+- 支持字体混合，标题和正文中的数字/英文自动使用 Times New Roman
+- 基于 jieba 分词的标题智能折行，保证短语完整性
 
 ### app.py
 - Flask 后端 API
@@ -112,7 +113,7 @@ gov-weekly-ofd/
 
 - **标题**：方正小标宋简体（FZXBSJW.TTF）
 - **正文**：仿宋 GB2312 或标准仿宋体简（FangSong）
-- **英文**：Times New Roman
+- **英文/数字**：Times New Roman（标题和正文中均自动应用）
 
 字体搜索路径：
 - Windows: `C:/Windows/Fonts` 和 `~/AppData/Local/Microsoft/Windows/Fonts`
@@ -183,4 +184,4 @@ MIT License - 详见 LICENSE 文件
 
 ---
 
-**最后更新**：2026-04-13
+**最后更新**：2026-04-15

@@ -141,6 +141,29 @@
         class="mt-2 text-xs text-gov-muted hover:text-gov-red transition">清除日志</button>
     </section>
 
+    <!-- 单篇文章生成 -->
+    <section class="bg-white rounded-lg border border-gov-border shadow-sm p-5">
+      <h2 class="font-title text-lg font-bold text-gov-text mb-4 flex items-center gap-2">
+        <svg class="w-5 h-5 text-gov-red" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+        单篇文章生成
+      </h2>
+      <p class="text-sm text-gov-muted mb-3">输入单篇文章的 URL，直接生成 DOCX + OFD 并下载</p>
+      <div class="flex gap-3">
+        <input type="url" x-model="articleUrl"
+          class="flex-1 border border-gov-border rounded-md px-3 py-2 text-sm focus:ring-2 focus:ring-gov-red/30 focus:border-gov-red outline-none"
+          placeholder="https://www.hubei.gov.cn/...">
+        <button @click="generateArticle()" :disabled="articleGenerating"
+          class="px-5 py-2 bg-gov-red text-white text-sm font-medium rounded-md hover:bg-red-800 transition disabled:opacity-50 whitespace-nowrap">
+          <span x-show="!articleGenerating">生成并下载</span>
+          <span x-show="articleGenerating" x-cloak class="flex items-center gap-1">
+            <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+            生成中…
+          </span>
+        </button>
+      </div>
+      <div x-show="articleError" x-cloak class="mt-2 text-sm text-red-600" x-text="articleError"></div>
+    </section>
+
     <!-- 周报文件列表 -->
     <section class="bg-white rounded-lg border border-gov-border shadow-sm p-5">
       <div class="flex items-center justify-between mb-4">
@@ -167,7 +190,15 @@
                   <button @click="range._open = !range._open"
                     class="w-full text-left px-4 py-3 bg-gov-bg hover:bg-gray-100 flex items-center justify-between">
                     <span class="font-medium text-sm" x-text="range.name"></span>
-                    <span class="text-xs text-gov-muted" x-text="range.leaders.length + ' 位领导'"></span>
+                    <div class="flex items-center gap-3">
+                      <span class="text-xs text-gov-muted" x-text="range.leaders.length + ' 位领导'"></span>
+                      <a :href="'/api/download-zip/' + encodeURI(year.name) + '/' + encodeURI(range.name)"
+                         @click.stop
+                         class="text-xs px-2 py-1 bg-gov-red text-white rounded hover:bg-red-800 transition whitespace-nowrap"
+                         title="打包下载该期全部文件（目录与生成目录一致）">
+                        ↓ 打包下载
+                      </a>
+                    </div>
                   </button>
                   <div x-show="range._open" x-cloak class="divide-y divide-gov-border">
                     <template x-for="leader in range.leaders" :key="leader.name">
@@ -221,6 +252,9 @@
         reports: [],
         status: { running: false, current: '', progress: 0, total: 0, log: [] },
         _pollTimer: null,
+        articleUrl: '',
+        articleGenerating: false,
+        articleError: '',
 
         async init() {
           await this.loadConfig();
@@ -303,6 +337,40 @@
 
         clearLog() {
           this.status.log = [];
+        },
+
+        async generateArticle() {
+          if (!this.articleUrl.trim()) { this.articleError = '请输入文章URL'; return; }
+          this.articleError = '';
+          this.articleGenerating = true;
+          try {
+            const res = await fetch('/api/generate-article', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: this.articleUrl.trim() }),
+            });
+            if (!res.ok) {
+              const data = await res.json();
+              this.articleError = data.error || '生成失败';
+              return;
+            }
+            // 触发下载
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            const cd = res.headers.get('Content-Disposition') || '';
+            const m = cd.match(/filename\*?=(?:UTF-8'')?([^;]+)/);
+            a.download = m ? decodeURIComponent(m[1].replace(/"+/g, '')) : 'article.zip';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+          } catch (e) {
+            this.articleError = '请求失败: ' + e.message;
+          } finally {
+            this.articleGenerating = false;
+          }
         },
 
         async loadReports() {

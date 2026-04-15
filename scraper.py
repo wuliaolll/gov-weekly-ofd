@@ -3,6 +3,7 @@
 解析湖北省人民政府门户网站政务周报栏目页和详情页
 """
 
+import os
 import re
 import subprocess
 import requests
@@ -26,9 +27,10 @@ KNOWN_LEADERS = [
 
 
 def fetch_page(url: str) -> str:
-    """获取指定URL的HTML内容，使用curl.exe绕过Python SSL兼容性问题"""
+    """获取指定URL的HTML内容，使用curl绕过Python SSL兼容性问题"""
+    curl_cmd = "curl.exe" if os.name == "nt" else "curl"
     result = subprocess.run(
-        ["curl.exe", "-k", "-s", "-L", "--max-time", "30",
+        [curl_cmd, "-k", "-s", "-L", "--max-time", "30",
          "-H", f"User-Agent: {HEADERS['User-Agent']}",
          url],
         capture_output=True, timeout=60,
@@ -132,14 +134,19 @@ def _extract_paragraphs(container) -> list[dict]:
     """
     从内容容器提取段落信息。
     每个段落包含: text, html, links, is_date_header, leader_name
+
+    去重策略：跳过包含可处理子元素的容器元素，避免父+子重复。
+    不使用全局 seen_texts 去重，否则同一段落（如 ►►► 、领导名）在不同日期区间多次出现时会被错误丢弃。
     """
+    # 可直接处理的元素类型（语义段落单元）
+    PROCESSABLE = {"p", "h1", "h2", "h3", "h4", "td", "th", "li"}
     paragraphs = []
 
     for elem in container.descendants:
-        if elem.name not in ("p", "div", "span", "strong", "b", "h1", "h2", "h3", "h4"):
+        if elem.name not in PROCESSABLE:
             continue
-        # 避免嵌套重复
-        if elem.find_parent(["p", "h1", "h2", "h3", "h4"]) and elem.name in ("strong", "b", "span"):
+        # 跳过包含可处理子元素的容器（其内容将由子元素单独处理，避免重复）
+        if any(c.name in PROCESSABLE for c in elem.children if hasattr(c, 'name') and c.name):
             continue
 
         text = elem.get_text(strip=True)
@@ -150,12 +157,16 @@ def _extract_paragraphs(container) -> list[dict]:
         date_match = re.match(r"^(\d{1,2}月\d{1,2}日)$", text)
         is_date = bool(date_match)
 
-        # 提取链接
+        # 提取链接：优先"详情<<"类，同时保留所有政府文章 URL（.shtml/.html）
         links = []
         for a in elem.find_all("a", href=True):
+            href = a["href"].strip()
+            if not href or href.startswith("javascript") or href == "#":
+                continue
             link_text = a.get_text(strip=True)
-            if "详情" in link_text or "<<" in link_text:
-                links.append(a["href"])
+            if ("详情" in link_text or "<<" in link_text
+                    or href.endswith(".shtml") or href.endswith(".html")):
+                links.append(href)
 
         paragraphs.append({
             "text": text,
@@ -175,24 +186,33 @@ def _group_by_date(paragraphs: list[dict]) -> list[dict]:
     current_activities = []
     buffer_texts = []
     buffer_links = []
+    current_leader_hint = None  # 由 ►► 领导名 行设置，作为 _identify_leader 的兜底
 
     def flush_buffer():
         nonlocal buffer_texts, buffer_links
         if not buffer_texts:
             return
         combined = "\n".join(buffer_texts)
-        leader = _identify_leader(combined)
+        leader = current_leader_hint
         if leader:
+            # 提取概览标题：第一条短文本（不以日期开头、不含"详情"）
+            overview = ""
+            if buffer_texts:
+                first = buffer_texts[0].strip()
+                first = re.sub(r'\s*详情\s*[<＜《]+.*$', '', first).strip()
+                if not re.match(r'^\d{1,2}月\d{1,2}日', first):
+                    overview = first
             current_activities.append({
                 "leader": leader,
                 "summary": combined,
+                "overview_title": overview,
                 "detail_url": buffer_links[0] if buffer_links else "",
             })
         buffer_texts = []
         buffer_links = []
 
-    # ►►► 标记是活动块分隔符
-    arrow_pattern = re.compile(r"^►{2,}")
+    # ► 或 ►► 标记是活动块分隔符（一个或多个 ►）
+    arrow_pattern = re.compile(r"^►+")
 
     for para in paragraphs:
         text = para["text"]
@@ -205,21 +225,33 @@ def _group_by_date(paragraphs: list[dict]) -> list[dict]:
             current_activities = []
             buffer_texts = []
             buffer_links = []
+            current_leader_hint = None
             continue
 
         if current_date is None:
             continue
 
-        # 检测 ►►► 作为新活动块的开始
+        # 检测 ►+ 开头：分隔符，箭头后可能直接跟着领导名（如 "►► 李殿勋"）
         if arrow_pattern.match(text):
             flush_buffer()
+            remainder = arrow_pattern.sub("", text).strip()
+            if remainder in KNOWN_LEADERS:
+                # 纯领导名：只更新 hint，不写入 buffer（避免重复条目）
+                current_leader_hint = remainder
+            elif remainder:
+                # 箭头后跟的是活动描述，直接进 buffer
+                buffer_texts.append(remainder)
+                buffer_links.extend(para["links"])
+            else:
+                # 纯箭头分隔符（无名字），重置 hint
+                current_leader_hint = None
             continue
 
-        # 检测独立领导名行（粗体领导名单独成段）
+        # 检测独立领导名行（单独成段的领导姓名，如 "李殿勋"）
         stripped = text.strip()
         if stripped in KNOWN_LEADERS:
             flush_buffer()
-            buffer_texts.append(stripped)
+            current_leader_hint = stripped  # 设置 hint，不写入 buffer
             continue
 
         # 检测以领导名开头的新标题行（通常较长，包含活动描述）
@@ -238,6 +270,11 @@ def _group_by_date(paragraphs: list[dict]) -> list[dict]:
 
         buffer_texts.append(text)
         buffer_links.extend(para["links"])
+
+        # "详情<<"类链接段落标志一条活动的结束（参与人员+详情链接行）
+        # 立即 flush，但保留 current_leader_hint，以便同一领导的下一条活动继续归属
+        if para["links"] and buffer_texts and ("详情" in text or "<<" in text):
+            flush_buffer()
 
     # 收尾
     flush_buffer()
@@ -296,11 +333,15 @@ def fetch_article_content(url: str) -> dict:
                 # 过滤编辑/审核等署名信息
                 if re.match(r"^(编辑|责编|审核|扫一扫|来源|（编辑|（责编|（审核)", text):
                     continue
-                # 过滤末尾短署名行（纯中文人名，2-4个字）
-                if len(text) <= 4 and re.match(r"^[\u4e00-\u9fff]+$", text):
+                # 过滤末尾短署名行（纯中文人名，含全角空格，如「姚　盼」）
+                stripped = re.sub(r'[\s\u3000]+', '', text)
+                if len(stripped) <= 4 and re.match(r'^[\u4e00-\u9fff]+$', stripped):
                     continue
                 # 过滤"图解：..."等附加信息行
                 if re.match(r"^图解[：:]", text):
+                    continue
+                # 过滤记者署名，如（肖丽琼）（湖北日报记者邓伟）
+                if re.match(r'^[（(].*?记者.*?[）)]$', text) or re.match(r'^[（(][\u4e00-\u9fff\s\u3000]{1,8}[）)]$', text):
                     continue
                 # 检测对齐方式
                 style = p.get("style", "")
@@ -317,7 +358,33 @@ def fetch_article_content(url: str) -> dict:
                     continue
                 if re.match(r"^图解[：:]", line):
                     continue
+                # 过滤记者署名
+                if re.match(r'^[（(].*?记者.*?[）)]$', line) or re.match(r'^[（(][\u4e00-\u9fff\s\u3000]{1,8}[）)]$', line):
+                    continue
                 content_paragraphs.append({"text": line, "align": "left"})
+
+    # 从正文开头提取居中段落作为真正标题（舍弃 <h1> 标题）
+    body_title_parts = []
+    while content_paragraphs:
+        first = content_paragraphs[0]
+        if isinstance(first, dict) and first.get("align") == "center":
+            body_title_parts.append(first["text"])
+            content_paragraphs.pop(0)
+        else:
+            break
+    if body_title_parts:
+        title = "".join(body_title_parts)
+
+    # 清理末尾段落中拼接的记者署名，如 "...发展。（湖北日报记者邓伟）"
+    if content_paragraphs:
+        last = content_paragraphs[-1]
+        if isinstance(last, dict):
+            cleaned = re.sub(r'[（(][^）)]*?记者[^）)]*?[）)]\s*$', '', last["text"]).strip()
+            cleaned = re.sub(r'[（(][\u4e00-\u9fff\s\u3000]{1,8}[）)]\s*$', '', cleaned).strip()
+            if cleaned:
+                content_paragraphs[-1] = {**last, "text": cleaned}
+            else:
+                content_paragraphs.pop()
 
     content = "\n\n".join(
         p["text"] if isinstance(p, dict) else p for p in content_paragraphs
