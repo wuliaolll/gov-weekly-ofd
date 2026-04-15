@@ -22,6 +22,12 @@ output/
 *.log
 *.pid
 debug.pdf
+gov-weekly-ofd-*.zip
+
+# Fonts (copyrighted, not redistributable)
+fonts/*.ttf
+fonts/*.TTF
+!fonts/README.txt
 
 # OS
 .DS_Store
