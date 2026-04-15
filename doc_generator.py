@@ -2,6 +2,7 @@
 文档生成模块 — DOCX + OFD
 按照公文格式模板生成文件
 """
+from __future__ import annotations
 
 import io
 import os

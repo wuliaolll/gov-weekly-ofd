@@ -2,6 +2,7 @@
 政务周报爬虫模块
 解析湖北省人民政府门户网站政务周报栏目页和详情页
 """
+from __future__ import annotations
 
 import os
 import re

@@ -1,6 +1,7 @@
 """
 政务周报 OFD 生成器 — Flask 主应用
 """
+from __future__ import annotations
 
 import json
 import os

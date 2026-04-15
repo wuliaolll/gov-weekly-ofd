@@ -8,7 +8,6 @@ set -e
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_NAME="gov-weekly"
-PYTHON_VER="3.12"
 PORT="${PORT:-5000}"
 
 echo "=========================================="
@@ -37,9 +36,24 @@ fi
 echo "[OK] curl: $(curl --version | head -1)"
 
 # ---------- 3. 创建 Conda 环境 ----------
+# 自动检测系统支持的最高 Python 版本（3.12 → 3.11 → 3.10 → 3.9）
 if conda env list | grep -q "^${ENV_NAME} "; then
     echo "[OK] conda 环境 '${ENV_NAME}' 已存在，跳过创建"
 else
+    PYTHON_VER=""
+    for ver in 3.12 3.11 3.10 3.9; do
+        echo "[...] 尝试 Python ${ver}..."
+        if conda create -n "${ENV_NAME}" python="${ver}" -y --dry-run &>/dev/null; then
+            PYTHON_VER="${ver}"
+            break
+        fi
+        echo "[WARN] Python ${ver} 不兼容当前系统，尝试更低版本..."
+    done
+    if [ -z "${PYTHON_VER}" ]; then
+        echo "[ERROR] 无法找到兼容的 Python 版本（需要 3.9+）"
+        echo "[HINT] 您的系统 glibc 版本可能过低，请考虑升级操作系统或使用 Docker"
+        exit 1
+    fi
     echo "[...] 创建 conda 环境: ${ENV_NAME} (Python ${PYTHON_VER})"
     conda create -n "${ENV_NAME}" python="${PYTHON_VER}" -y
 fi
