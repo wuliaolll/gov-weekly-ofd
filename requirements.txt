@@ -8,5 +8,7 @@ easyofd>=0.5
 apscheduler>=3.10
 jieba>=0.42
 PyMuPDF>=1.23
+# TLS 指纹伪装（用于通过 JS 挑战类 WAF，CentOS 7 兼容）
+curl-cffi>=0.7
 Pillow>=10.0
 gunicorn>=21.0

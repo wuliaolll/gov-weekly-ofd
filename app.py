@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 
 from flask import Flask, jsonify, request, render_template, send_file, abort
 
@@ -19,6 +21,45 @@ app = Flask(__name__)
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output" / "门户网站周报"
 CONFIG_PATH = BASE_DIR / "config.json"
+LOG_DIR = BASE_DIR / "logs"
+APP_LOG_PATH = LOG_DIR / "app.log"
+
+
+def _init_logging() -> None:
+    """初始化应用日志：同时输出到控制台和文件。"""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    has_file_handler = any(
+        isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "") == str(APP_LOG_PATH)
+        for h in root.handlers
+    )
+    if not has_file_handler:
+        file_handler = RotatingFileHandler(
+            APP_LOG_PATH,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
+    has_stream_handler = any(isinstance(h, logging.StreamHandler) for h in root.handlers)
+    if not has_stream_handler:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        root.addHandler(stream_handler)
+
+
+_init_logging()
+logger = logging.getLogger(__name__)
 
 # 任务状态存储（轻量，不用数据库）
 task_status = {
@@ -111,6 +152,7 @@ def do_collect_and_generate(column_url: str, report_url: str = None):
         task_status["log"] = []
 
     try:
+        logger.info("collect start, column_url=%s, report_url=%s", column_url, report_url or "")
         # 获取周报列表
         if report_url:
             reports = [{"title": "手动指定", "url": report_url, "pub_date": ""}]
@@ -214,10 +256,12 @@ def do_collect_and_generate(column_url: str, report_url: str = None):
             task_status["progress"] = idx + 1
 
         _add_log("=== 采集生成完成 ===")
+        logger.info("collect done, reports=%s", len(reports))
         task_status["current"] = "完成"
 
     except Exception as e:
         _add_log(f"采集异常: {e}")
+        logger.exception("collect failed")
         task_status["current"] = f"错误: {e}"
     finally:
         task_status["running"] = False
@@ -368,10 +412,19 @@ def column_preview():
     if not url:
         return jsonify({"error": "请提供URL"}), 400
     try:
+        logger.info("column-preview start, url=%s", url)
         reports = parse_column_page(url)
+        if not reports:
+            logger.warning("column-preview empty result, url=%s", url)
+            return jsonify({
+                "error": "栏目预览返回0条，疑似被WAF拦截或页面结构变化",
+                "log_path": str(APP_LOG_PATH),
+            }), 502
+        logger.info("column-preview done, url=%s, count=%s", url, len(reports))
         return jsonify(reports)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.exception("column-preview failed, url=%s", url)
+        return jsonify({"error": str(e), "log_path": str(APP_LOG_PATH)}), 500
 
 
 @app.route("/api/generate-article", methods=["POST"])
@@ -443,6 +496,7 @@ def generate_article():
 
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("app start, log file=%s", APP_LOG_PATH)
 
     cfg = load_config()
     if cfg.get("auto_collect"):

@@ -84,9 +84,13 @@
           class="px-4 py-2 bg-gov-red text-white text-sm font-medium rounded-md hover:bg-red-800 transition">
           保存配置
         </button>
-        <button @click="previewColumn()"
-          class="px-4 py-2 border border-gov-red text-gov-red text-sm font-medium rounded-md hover:bg-red-50 transition">
-          预览栏目
+        <button @click="previewColumn()" :disabled="previewLoading"
+          class="px-4 py-2 border border-gov-red text-gov-red text-sm font-medium rounded-md hover:bg-red-50 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1">
+          <span x-show="!previewLoading">预览栏目</span>
+          <span x-show="previewLoading" x-cloak class="flex items-center gap-1">
+            <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+            加载中…
+          </span>
         </button>
         <button @click="collectAll()" :disabled="status.running"
           class="px-4 py-2 bg-gov-gold text-white text-sm font-medium rounded-md hover:opacity-90 transition disabled:opacity-50">
@@ -94,6 +98,7 @@
         </button>
         <span x-show="configMsg" x-cloak x-text="configMsg" class="text-sm text-green-600"></span>
       </div>
+      <div x-show="previewError" x-cloak class="mt-3 text-sm text-red-600 whitespace-pre-wrap" x-text="previewError"></div>
     </section>
 
     <!-- 栏目预览 -->
@@ -248,6 +253,8 @@
       return {
         config: { column_url: '', schedule_hour: 8, schedule_minute: 0, auto_collect: true },
         configMsg: '',
+        previewError: '',
+        previewLoading: false,
         previewList: [],
         reports: [],
         status: { running: false, current: '', progress: 0, total: 0, log: [] },
@@ -280,17 +287,40 @@
         },
 
         async previewColumn() {
+          if (this.previewLoading) return;
           this.previewList = [];
+          this.previewError = '';
+          this.previewLoading = true;
           try {
             const res = await fetch('/api/column-preview', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ url: this.config.column_url }),
             });
-            const data = await res.json();
-            if (data.error) { alert(data.error); return; }
+
+            let data = null;
+            const raw = await res.text();
+            try {
+              data = JSON.parse(raw);
+            } catch {
+              this.previewError = `预览失败（非JSON响应，HTTP ${res.status}）\n${raw.slice(0, 300)}`;
+              return;
+            }
+
+            if (!res.ok || data.error) {
+              const logHint = data.log_path ? `\n服务器日志: ${data.log_path}` : '';
+              this.previewError = `预览失败: ${data.error || `HTTP ${res.status}`}${logHint}`;
+              return;
+            }
             this.previewList = data;
-          } catch (e) { alert('预览失败: ' + e.message); }
+            if (!Array.isArray(this.previewList) || this.previewList.length === 0) {
+              this.previewError = '预览结果为空，可能被目标站拦截或页面结构变化。';
+            }
+          } catch (e) {
+            this.previewError = '预览失败: ' + e.message;
+          } finally {
+            this.previewLoading = false;
+          }
         },
 
         async collectAll() {

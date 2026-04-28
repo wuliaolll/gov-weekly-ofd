@@ -7,9 +7,8 @@ from __future__ import annotations
 import io
 import os
 import re
+import unicodedata
 from pathlib import Path
-
-from docx.oxml import OxmlElement
 
 from docx import Document
 from docx.shared import Pt, Cm, Emu
@@ -102,6 +101,65 @@ def _text_width(s: str) -> float:
     return sum(_char_width(c) for c in s)
 
 
+def _clean_title_text(title: str) -> str:
+    """清理网页标题中的隐藏字符，保留可见空格与换行。"""
+    if not title:
+        return ""
+
+    # 1. 去除所有换行变体（HTML 结构噪声，不是有含义的标题换行）。
+    normalized = (
+        title.replace("\r\n", "")
+        .replace("\r", "")
+        .replace("\n", "")
+        .replace("\u2028", "")   # line separator
+        .replace("\u2029", "")   # paragraph separator
+        .replace("\u0085", "")   # NEL
+    )
+    # 2. 将所有 Unicode 空格类（Zs）统一为普通空格。
+    #    覆盖范围：U+00A0 NBSP、U+2002 en-space、U+2003 em-space、
+    #    U+202F narrow-NBSP、U+205F math-space、U+3000 全角空格等。
+    normalized = "".join(
+        " " if unicodedata.category(ch) == "Zs" else ch
+        for ch in normalized
+    )
+
+    # 去除零宽/方向控制等隐藏字符，不影响普通空格和换行。
+    hidden_chars = {
+        "\u00AD",  # soft hyphen
+        "\u034F",  # combining grapheme joiner
+        "\u061C",  # arabic letter mark
+        "\u180E",  # mongolian vowel separator
+        "\u200B", "\u200C", "\u200D",  # zero-width chars
+        "\u200E", "\u200F",  # lrm/rlm
+        "\u2060",  # word joiner
+        "\uFEFF",  # zero-width no-break space / bom
+        # 网页复制噪声里常见的“圆圈样”占位符，需直接剔除。
+        "\u00B0",  # degree sign: °
+        "\u02DA",  # ring above: ˚
+        "\u2218",  # ring operator: ∘
+        "\u25E6",  # white bullet: ◦
+        "\u25CB",  # white circle: ○
+        "\u25CC",  # dotted circle: ◌
+        # 回车/换行的可视化符号（不是实际换行），网页复制时可能混入。
+        "\u21B5",  # carriage return arrow: ↵
+        "\u23CE",  # return symbol: ⏎
+        "\u240A",  # symbol for line feed: ␊
+        "\u240D",  # symbol for carriage return: ␍
+    }
+    hidden_chars.update(chr(c) for c in range(0x202A, 0x202F))  # bidi embedding controls
+    hidden_chars.update(chr(c) for c in range(0x2066, 0x206A))  # bidi isolate controls
+
+    cleaned = "".join(ch for ch in normalized if ch not in hidden_chars)
+    # 兜底剔除控制符（保留普通空格和换行）。
+    cleaned = "".join(
+        ch for ch in cleaned
+        if ch == " " or unicodedata.category(ch) not in {"Cc", "Cf"}
+    )
+
+    # 5. 合并连续空格，去除首尾空格。
+    return re.sub(r" {2,}", " ", cleaned).strip()
+
+
 def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[str]:
     """基于语义断点的标题智能折行。
 
@@ -111,14 +169,16 @@ def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[
        - 评分 = 断点语义惩罚之和（越低越好）
        - 轻微均匀性偏好作为 tiebreaker
     """
+    title = _clean_title_text(title)
+
     total = _text_width(title)
     if total <= max_width:
-        return [title.replace(' ', '').replace('\u3000', '')]
+        return [title]
 
     # --- 空格分隔的标题：直接按空格拆分短语，再合并成最少行 ---
-    if ' ' in title or '\u3000' in title:
+    if ' ' in title:
         import re as _re
-        segments = [s for s in _re.split(r'[ \u3000]+', title) if s]
+        segments = [s for s in _re.split(r'[ ]+', title) if s]
         # 所有片段都不超宽才走快速路径
         if all(_text_width(s) <= max_width for s in segments):
             import math as _m
@@ -171,15 +231,10 @@ def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[
             _try_partition(0, [])
             if best_lines:
                 return best_lines
-        # 片段超宽，回退到下面的完整算法（去掉空格）
-        title = ''.join(segments)
-        total = _text_width(title)
-    else:
-        # 无空格标题，跳过空格相关处理
-        pass
+        # 片段超宽或无空格标题 → 落入 jieba 语义 DP
 
-    # 无空格标题 — 原始空格位置不再需要
-    space_positions = set()
+    # jieba DP 语义折行（有无空格都走此路径）
+    space_positions: set[int] = set()
 
     import math
     import jieba
@@ -238,6 +293,9 @@ def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[
     pos = 0
     for i, w in enumerate(words):
         pos += len(w)
+        # 空格 token 是自然短语边界，记录其结束位置
+        if w == " ":
+            space_positions.add(pos)
         if i < len(words) - 1:
             flag_i = flags[i]
             flag_next = flags[i + 1]
@@ -403,18 +461,23 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
     if doc.paragraphs:
         doc.paragraphs[0].clear()
 
-    # 标题（智能折行：每行是完整分词/短句）
-    title_para = doc.add_paragraph()
-    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _set_line_spacing_fixed(title_para, 32)
-    title_para.paragraph_format.space_before = Pt(0)
-    title_para.paragraph_format.space_after = Pt(0)
+    # 标题上方空一行
+    top_spacer = doc.add_paragraph()
+    top_spacer.paragraph_format.space_before = Pt(0)
+    top_spacer.paragraph_format.space_after = Pt(0)
+    _set_line_spacing_fixed(top_spacer, 32)
 
+    # 标题（智能折行：每行独立段落，均居中，行间距固定 32pt）
+    # 每行用独立 <w:p> 而非 <w:br/>，使 Word 中每行都显示为"正常段落换行"（←/¶）。
     title_lines = _smart_title_lines(title)
-    for i, line in enumerate(title_lines):
+    for line in title_lines:
+        title_para = doc.add_paragraph()
+        title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _set_line_spacing_fixed(title_para, 32)
+        title_para.paragraph_format.space_before = Pt(0)
+        title_para.paragraph_format.space_after = Pt(0)
         # 拆分中文和英文/数字，分别设置字体
-        segments = _split_cn_en(line)
-        for text, is_ascii in segments:
+        for text, is_ascii in _split_cn_en(line):
             title_run = title_para.add_run(text)
             title_run.font.size = Pt(22)  # 二号
             if is_ascii:
@@ -422,11 +485,6 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
             else:
                 _set_font_name(title_run, "方正小标宋简体", "FZXiaoBiaoSong")
             title_run.font.color.rgb = None  # 黑色
-        if i < len(title_lines) - 1:
-            # 插入软换行（同段内换行）
-            br_run = title_para.add_run()
-            br_elem = OxmlElement("w:br")
-            br_run._element.append(br_elem)
 
     # 标题与正文间空一行
     spacer = doc.add_paragraph()
@@ -631,6 +689,9 @@ def generate_ofd(title: str, content: str, output_path: str, paragraphs: list[di
     )
 
     story = []
+
+    # 标题上方空一行
+    story.append(Spacer(1, 32))
 
     # 标题（智能折行）
     en_font = "TimesNewRoman" if TNR_PATH else None
