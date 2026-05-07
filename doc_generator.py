@@ -448,6 +448,9 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
     """
     doc = Document()
 
+    # 全局关闭孤行控制（widowControl），避免 Word 自动勾选导致排版异常
+    doc.styles['Normal'].paragraph_format.widow_control = False
+
     # 页面设置
     section = doc.sections[0]
     section.page_width = Cm(21.0)
