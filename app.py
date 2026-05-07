@@ -12,7 +12,10 @@ from logging.handlers import RotatingFileHandler
 
 from flask import Flask, jsonify, request, render_template, send_file, abort
 
-from scraper import parse_column_page, parse_weekly_report, fetch_article_content
+from scraper import (
+    parse_column_page, parse_weekly_report, fetch_article_content,
+    discover_leaders, parse_leader_activity_list, extract_activity_date,
+)
 from doc_generator import generate_docx, generate_ofd
 from scheduler import init_scheduler
 
@@ -20,6 +23,8 @@ app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output" / "门户网站周报"
+DAILY_OUTPUT_DIR = BASE_DIR / "output" / "领导动态"
+EXPORT_HISTORY_PATH = BASE_DIR / "export_history.json"
 CONFIG_PATH = BASE_DIR / "config.json"
 LOG_DIR = BASE_DIR / "logs"
 APP_LOG_PATH = LOG_DIR / "app.log"
@@ -138,6 +143,180 @@ def _extract_year_and_range(title: str) -> tuple[str, str]:
     range_clean = re.sub(r"\d{4}年", "", range_clean).strip()
 
     return year, range_clean
+
+
+def compute_export_window(start_from: str = None) -> tuple:
+    """计算本次导出的时间窗口 (start_dt, end_dt)。
+
+    end_dt = 当前时刻；
+    start_dt = start_from（若手动指定）或昨天的导出时间戳（若有）或昨天 00:00:00。
+    """
+    from datetime import datetime, timedelta
+    end_dt = datetime.now()
+    if start_from:
+        try:
+            start_dt = datetime.fromisoformat(start_from)
+        except Exception:
+            start_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return start_dt, end_dt
+    today = end_dt.date()
+    yesterday = (end_dt - timedelta(days=1)).date()
+    history = {}
+    if EXPORT_HISTORY_PATH.exists():
+        try:
+            history = json.loads(EXPORT_HISTORY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    # 同一天多次导出：优先用今天的上次导出时间；否则用昨天的；最后回退到昨天 00:00
+    for key in (str(today), str(yesterday)):
+        if key in history:
+            try:
+                start_dt = datetime.fromisoformat(history[key])
+                return start_dt, end_dt
+            except Exception:
+                break
+    start_dt = datetime(yesterday.year, yesterday.month, yesterday.day)
+    return start_dt, end_dt
+
+
+def save_export_record(end_dt) -> None:
+    """将今天的导出时间戳写入 export_history.json。"""
+    history = {}
+    if EXPORT_HISTORY_PATH.exists():
+        try:
+            history = json.loads(EXPORT_HISTORY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    today_key = end_dt.strftime("%Y-%m-%d")
+    history[today_key] = end_dt.isoformat()
+    EXPORT_HISTORY_PATH.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def do_daily_export(start_from: str = None):
+    """每日领导动态导出（在后台线程中运行）。"""
+    from datetime import datetime
+    with task_lock:
+        if task_status["running"]:
+            return
+        task_status["running"] = True
+        task_status["progress"] = 0
+        task_status["total"] = 0
+        task_status["current"] = "每日导出：初始化..."
+        task_status["log"] = []
+
+    try:
+        start_dt, end_dt = compute_export_window(start_from)
+        _add_log(f"导出窗口: {start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')}")
+
+        # 导出目录名: {year}年_{M}月{D}日
+        export_label = f"{end_dt.year}年_{end_dt.month}月{end_dt.day}日"
+        DAILY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        export_dir = DAILY_OUTPUT_DIR / export_label
+
+        _add_log("正在发现领导列表...")
+        task_status["current"] = "发现领导..."
+        leaders = discover_leaders()
+        if not leaders:
+            _add_log("未发现任何领导，任务结束")
+            return
+        _add_log(f"发现 {len(leaders)} 位领导")
+
+        task_status["total"] = len(leaders)
+
+        for idx, leader in enumerate(leaders):
+            task_status["progress"] = idx
+            display = leader["display"]
+            task_status["current"] = f"采集: {display}"
+            _add_log(f"--- [{display}] 抓取活动列表: {leader['activity_url']}")
+
+            try:
+                articles = parse_leader_activity_list(leader["activity_url"], start_dt, end_dt)
+            except Exception as e:
+                _add_log(f"  列表抓取失败: {e}")
+                continue
+
+            _add_log(f"  找到 {len(articles)} 篇")
+
+            for art in articles:
+                art_title = art["title"]
+                art_url = art["url"]
+                pub_dt = art["pub_dt"]
+                task_status["current"] = f"{display} - {art_title[:20]}"
+
+                try:
+                    article = fetch_article_content(art_url)
+                except Exception as e:
+                    _add_log(f"  获取内容失败: {art_title[:30]} → {e}")
+                    continue
+
+                if not article.get("content"):
+                    _add_log(f"  内容为空，跳过: {art_title[:30]}")
+                    continue
+
+                # 用详情页的精准发布时间做二次过滤
+                detail_pub_date = article.get("pub_date", "")
+                if detail_pub_date:
+                    try:
+                        from datetime import datetime as _dt
+                        detail_dt = _dt.strptime(detail_pub_date.strip(), "%Y-%m-%d %H:%M")
+                        if detail_dt < start_dt or detail_dt > end_dt:
+                            _add_log(f"  时间窗口外（{detail_pub_date}），跳过: {art_title[:30]}")
+                            continue
+                    except ValueError:
+                        pass  # 解析失败则不过滤，保留文章
+
+                activity_date = extract_activity_date(article.get("paragraphs", []), pub_dt)
+                title_for_file = article.get("title") or art_title
+                title_safe = safe_filename(title_for_file)
+
+                out_dir = export_dir / safe_filename(display) / safe_filename(activity_date)
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                docx_path = out_dir / f"{title_safe}.docx"
+                ofd_path = out_dir / f"{title_safe}.ofd"
+
+                # 生成 DOCX（跳过已存在）
+                if not docx_path.exists():
+                    try:
+                        generate_docx(
+                            title=title_for_file,
+                            content=article["content"],
+                            output_path=str(docx_path),
+                            paragraphs=article.get("paragraphs"),
+                        )
+                        _add_log(f"  ✓ DOCX: {docx_path.name}")
+                    except Exception as e:
+                        _add_log(f"  ✗ DOCX失败: {e}")
+                else:
+                    _add_log(f"  已存在 DOCX，跳过: {docx_path.name}")
+
+                # 生成 OFD（跳过已存在）
+                if not ofd_path.exists():
+                    try:
+                        generate_ofd(
+                            title=title_for_file,
+                            content=article["content"],
+                            output_path=str(ofd_path),
+                            paragraphs=article.get("paragraphs"),
+                        )
+                        _add_log(f"  ✓ OFD: {ofd_path.name}")
+                    except Exception as e:
+                        import traceback
+                        _add_log(f"  ✗ OFD失败: {e}")
+
+            task_status["progress"] = idx + 1
+
+        save_export_record(end_dt)
+        _add_log("=== 每日导出完成 ===")
+        logger.info("daily export done, window=%s~%s", start_dt, end_dt)
+        task_status["current"] = "完成"
+
+    except Exception as e:
+        _add_log(f"每日导出异常: {e}")
+        logger.exception("daily export failed")
+        task_status["current"] = f"错误: {e}"
+    finally:
+        task_status["running"] = False
 
 
 def do_collect_and_generate(column_url: str, report_url: str = None):
@@ -294,20 +473,52 @@ def update_config():
 
 @app.route("/api/reports", methods=["GET"])
 def get_reports():
-    """获取已生成的周报文件树"""
-    if not OUTPUT_DIR.exists():
-        return jsonify([])
-
-    tree = []
-    for year_dir in sorted(OUTPUT_DIR.iterdir(), reverse=True):
-        if not year_dir.is_dir():
-            continue
-        year_node = {"name": year_dir.name, "ranges": []}
-        for range_dir in sorted(year_dir.iterdir(), reverse=True):
-            if not range_dir.is_dir():
+    """获取已生成的文件树，返回 {weekly: [...], daily: [...]}"""
+    # ---- 周报文件树（4 层：年 → 周期 → 领导 → 日期） ----
+    weekly_tree = []
+    if OUTPUT_DIR.exists():
+        for year_dir in sorted(OUTPUT_DIR.iterdir(), reverse=True):
+            if not year_dir.is_dir():
                 continue
-            range_node = {"name": range_dir.name, "leaders": []}
-            for leader_dir in sorted(range_dir.iterdir()):
+            year_node = {"name": year_dir.name, "ranges": []}
+            for range_dir in sorted(year_dir.iterdir(), reverse=True):
+                if not range_dir.is_dir():
+                    continue
+                range_node = {"name": range_dir.name, "leaders": []}
+                for leader_dir in sorted(range_dir.iterdir()):
+                    if not leader_dir.is_dir():
+                        continue
+                    leader_node = {"name": leader_dir.name, "dates": []}
+                    for date_dir in sorted(leader_dir.iterdir()):
+                        if not date_dir.is_dir():
+                            continue
+                        files = []
+                        for f in sorted(date_dir.iterdir()):
+                            if f.is_file() and f.suffix in (".docx", ".ofd"):
+                                rel = f.relative_to(OUTPUT_DIR)
+                                files.append({
+                                    "name": f.name,
+                                    "type": f.suffix[1:],
+                                    "path": str(rel).replace("\\", "/"),
+                                    "size": f.stat().st_size,
+                                })
+                        if files:
+                            leader_node["dates"].append({"name": date_dir.name, "files": files})
+                    if leader_node["dates"]:
+                        range_node["leaders"].append(leader_node)
+                if range_node["leaders"]:
+                    year_node["ranges"].append(range_node)
+            if year_node["ranges"]:
+                weekly_tree.append(year_node)
+
+    # ---- 每日动态文件树（3 层：导出日 → 领导 → 活动日期） ----
+    daily_tree = []
+    if DAILY_OUTPUT_DIR.exists():
+        for export_dir in sorted(DAILY_OUTPUT_DIR.iterdir(), reverse=True):
+            if not export_dir.is_dir():
+                continue
+            export_node = {"name": export_dir.name, "leaders": []}
+            for leader_dir in sorted(export_dir.iterdir()):
                 if not leader_dir.is_dir():
                     continue
                 leader_node = {"name": leader_dir.name, "dates": []}
@@ -317,7 +528,7 @@ def get_reports():
                     files = []
                     for f in sorted(date_dir.iterdir()):
                         if f.is_file() and f.suffix in (".docx", ".ofd"):
-                            rel = f.relative_to(OUTPUT_DIR)
+                            rel = f.relative_to(DAILY_OUTPUT_DIR)
                             files.append({
                                 "name": f.name,
                                 "type": f.suffix[1:],
@@ -325,18 +536,13 @@ def get_reports():
                                 "size": f.stat().st_size,
                             })
                     if files:
-                        leader_node["dates"].append({
-                            "name": date_dir.name,
-                            "files": files,
-                        })
+                        leader_node["dates"].append({"name": date_dir.name, "files": files})
                 if leader_node["dates"]:
-                    range_node["leaders"].append(leader_node)
-            if range_node["leaders"]:
-                year_node["ranges"].append(range_node)
-        if year_node["ranges"]:
-            tree.append(year_node)
+                    export_node["leaders"].append(leader_node)
+            if export_node["leaders"]:
+                daily_tree.append(export_node)
 
-    return jsonify(tree)
+    return jsonify({"weekly": weekly_tree, "daily": daily_tree})
 
 
 @app.route("/api/collect", methods=["POST"])
@@ -356,6 +562,71 @@ def collect():
     )
     t.start()
     return jsonify({"ok": True, "message": "采集任务已启动"})
+
+
+@app.route("/api/export-history", methods=["GET"])
+def get_export_history():
+    """返回 export_history.json 内容"""
+    if not EXPORT_HISTORY_PATH.exists():
+        return jsonify({})
+    try:
+        return jsonify(json.loads(EXPORT_HISTORY_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        return jsonify({})
+
+
+@app.route("/api/daily-export", methods=["POST"])
+def daily_export():
+    """手动触发每日领导动态导出"""
+    if task_status["running"]:
+        return jsonify({"error": "已有任务在运行"}), 409
+
+    data = request.get_json(silent=True) or {}
+    start_from = data.get("start_from") or None  # ISO datetime string 或 None
+
+    t = threading.Thread(target=do_daily_export, args=(start_from,), daemon=True)
+    t.start()
+    return jsonify({"ok": True, "message": "每日导出任务已启动"})
+
+
+@app.route("/api/daily-download/<path:filepath>")
+def daily_download(filepath):
+    """下载每日动态生成的文件"""
+    full_path = DAILY_OUTPUT_DIR / filepath
+    try:
+        full_path.resolve().relative_to(DAILY_OUTPUT_DIR.resolve())
+    except ValueError:
+        abort(403)
+    if not full_path.exists() or not full_path.is_file():
+        abort(404)
+    return send_file(full_path, as_attachment=True)
+
+
+@app.route("/api/daily-download-zip/<path:period_path>")
+def daily_download_zip(period_path):
+    """打包下载某次每日导出的全部文件"""
+    import zipfile
+    import io as _io
+
+    period_dir = DAILY_OUTPUT_DIR / period_path
+    try:
+        period_dir.resolve().relative_to(DAILY_OUTPUT_DIR.resolve())
+    except ValueError:
+        abort(403)
+    if not period_dir.exists() or not period_dir.is_dir():
+        abort(404)
+
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in sorted(period_dir.rglob("*")):
+            if not f.is_file() or f.suffix.lower() not in (".docx", ".ofd"):
+                continue
+            rel = f.relative_to(period_dir)
+            zf.write(f, str(rel).replace("\\", "/"))
+    buf.seek(0)
+
+    zip_name = safe_filename(period_path.replace("/", "_").replace("\\", "_")) + ".zip"
+    return send_file(buf, as_attachment=True, download_name=zip_name, mimetype="application/zip")
 
 
 @app.route("/api/status", methods=["GET"])

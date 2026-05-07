@@ -1074,6 +1074,224 @@ def fetch_article_content(url: str) -> dict:
     return {"title": title, "content": content, "pub_date": pub_date, "paragraphs": content_paragraphs}
 
 
+# ============ 领导动态每日采集 ============
+
+def discover_leaders(szf_url: str = "https://www.hubei.gov.cn/szf/") -> list[dict]:
+    """从省政府领导页自动发现各领导及其政务活动列表URL。"""
+    logger.info("discover_leaders: fetching %s", szf_url)
+    html = fetch_page(szf_url)
+    if not html:
+        logger.warning("discover_leaders: empty response from %s", szf_url)
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    base = "https://www.hubei.gov.cn"
+
+    # 找所有领导个人主页链接（含 /szf/sld/{slug}/index.shtml，支持 // http https 等前缀）
+    seen_slugs: set[str] = set()
+    leaders: list[dict] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        m = re.search(r"/szf/sld/([^/]+)/index\.shtml", href)
+        if not m:
+            continue
+        slug = m.group(1)
+        if slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+
+        # 从链接文字直接取姓名（页面已标注，如"李殿勋"）
+        name_from_text = a.get_text(strip=True)
+
+        # 规范化 profile URL
+        if href.startswith("//"):
+            profile_url = "https:" + href
+        elif href.startswith("/"):
+            profile_url = base + href
+        else:
+            profile_url = href
+
+        leader = _parse_leader_profile(profile_url, base, name_hint=name_from_text)
+        if leader:
+            leaders.append(leader)
+            logger.info("discover_leaders: %s → %s", leader["display"], leader["activity_url"])
+        time.sleep(random.uniform(0.3, 0.8))
+
+    logger.info("discover_leaders: total %d leaders discovered", len(leaders))
+    return leaders
+
+
+def _parse_leader_profile(profile_url: str, base: str = "https://www.hubei.gov.cn", name_hint: str = "") -> dict | None:
+    """解析领导个人主页，提取姓名、职务和政务活动列表URL。"""
+    html = fetch_page(profile_url)
+    if not html:
+        logger.warning("_parse_leader_profile: no html for %s", profile_url)
+        return None
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # 1. 从 img alt="职务：姓名" 提取
+    name, title_str = "", ""
+    for img in soup.find_all("img", alt=True):
+        alt = img["alt"].strip()
+        m = re.match(r"(.+?)[：:]\s*(.+)", alt)
+        if m:
+            t, n = m.group(1).strip(), m.group(2).strip()
+            if any(k in t for k in ["省长", "副省长", "常务", "秘书长"]):
+                title_str, name = t, n
+                break
+
+    # 2. fallback: h1-h4 标签
+    if not name:
+        for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
+            text = tag.get_text(strip=True)
+            m = re.match(r"(.+?)[：:]\s*(.+)", text)
+            if m and any(k in m.group(1) for k in ["省长", "副省长", "常务", "秘书长"]):
+                title_str, name = m.group(1).strip(), m.group(2).strip()
+                break
+
+    # 3. fallback: 页面自由文本
+    if not name:
+        page_text = soup.get_text(" ")
+        m = re.search(r"((?:常务)?副?省长|秘书长)[：:\s]*([^\s，。,]{2,4})", page_text)
+        if m:
+            title_str, name = m.group(1).strip(), m.group(2).strip()
+
+    # 4. 兜底：使用来自列表页的 name_hint
+    if not name and name_hint:
+        name = name_hint
+
+    if not name:
+        logger.warning("_parse_leader_profile: cannot extract name from %s", profile_url)
+        return None
+
+    display = name + (title_str if title_str else "副省长")
+
+    # 寻找政务活动列表URL（含 zyhd/zwb_hy 的链接，或文字为"政务活动"）
+    activity_url = None
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        link_text = a.get_text(strip=True)
+        if "政务活动" in link_text or re.search(r"zyhd|zwb_hy", href):
+            candidate = urljoin(profile_url, href)
+            if "hubei.gov.cn" in candidate:
+                if not candidate.endswith("index.shtml"):
+                    candidate = candidate.rstrip("/") + "/index.shtml"
+                activity_url = candidate
+                break
+
+    # fallback: /szf/sld/{slug}/zyhd/index.shtml
+    if not activity_url:
+        activity_url = re.sub(r"/index\.shtml$", "/zyhd/index.shtml", profile_url)
+
+    return {"name": name, "display": display, "activity_url": activity_url}
+
+
+def parse_leader_activity_list(
+    activity_url: str, start_dt: datetime, end_dt: datetime
+) -> list[dict]:
+    """翻页抓取领导政务活动列表，返回 [start_dt, end_dt] 区间内的文章。"""
+    results: list[dict] = []
+    seen_urls: set[str] = set()
+    base = "https://www.hubei.gov.cn"
+
+    for page_idx in range(21):  # 最多 21 页（page 0~20）
+        if page_idx == 0:
+            page_url = activity_url
+        else:
+            page_url = re.sub(r"index(_\d+)?\.shtml$", f"index_{page_idx}.shtml", activity_url)
+
+        logger.info("parse_leader_activity_list: page %d → %s", page_idx, page_url)
+        html = fetch_page(page_url)
+        if not html:
+            logger.warning("parse_leader_activity_list: empty page %d, stop", page_idx)
+            break
+
+        soup = BeautifulSoup(html, "lxml")
+        items_on_page = 0
+        oldest_dt_on_page: datetime | None = None
+        stop_paging = False
+
+        for tag in soup.find_all(["li", "tr", "div"]):
+            a = tag.find("a", href=True)
+            if not a:
+                continue
+            title = a.get_text(strip=True)
+            if not title or len(title) < 7:
+                continue
+            href = a["href"]
+            # 必须是 .shtml 文章链接，否则为导航/目录
+            if not href.rstrip("/").endswith(".shtml") and ".shtml" not in href:
+                continue
+            full_url = urljoin(base, href) if href.startswith("/") else urljoin(activity_url, href)
+
+            tag_text = tag.get_text(" ")
+            dm = re.search(r"(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})", tag_text)
+            if not dm:
+                dm = re.search(r"(\d{4})-(\d{2})-(\d{2})", tag_text)
+            if not dm:
+                continue
+
+            try:
+                if len(dm.groups()) >= 5:
+                    pub_dt = datetime(
+                        int(dm.group(1)), int(dm.group(2)), int(dm.group(3)),
+                        int(dm.group(4)), int(dm.group(5)),
+                    )
+                else:
+                    pub_dt = datetime(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
+            except ValueError:
+                continue
+
+            items_on_page += 1
+            if oldest_dt_on_page is None or pub_dt < oldest_dt_on_page:
+                oldest_dt_on_page = pub_dt
+
+            # 列表页只有日期无时分秒，用 .date() 做粗筛，精准时分秒过滤交给详情页
+            if pub_dt.date() < start_dt.date():
+                stop_paging = True
+                continue
+            if pub_dt.date() > end_dt.date():
+                continue
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            results.append({"title": title, "url": full_url, "pub_dt": pub_dt})
+
+        if items_on_page == 0 or stop_paging:
+            break
+        time.sleep(random.uniform(0.5, 1.0))
+
+    return results
+
+
+def extract_activity_date(paragraphs: list, pub_dt: datetime) -> str:
+    """从正文第一段提取活动日期字符串（如"4月22日"）。"""
+    text = ""
+    if paragraphs:
+        first = paragraphs[0]
+        text = first.get("text", "") if isinstance(first, dict) else str(first)
+        text = text[:120]
+
+    # 模式1: X月X日至Y月Y日 → Y月Y日（跨月区间取结束日）
+    m = re.search(r"(\d+)月(\d+)日至(\d+)月(\d+)日", text)
+    if m:
+        return f"{m.group(3)}月{m.group(4)}日"
+
+    # 模式2: X月X至Y日 → X月Y日（同月区间取结束日）
+    m = re.search(r"(\d+)月(\d+)至(\d+)日", text)
+    if m:
+        return f"{m.group(1)}月{m.group(3)}日"
+
+    # 模式3&4: X月X日（单日或后跟上午/下午/晚/夜）
+    m = re.search(r"(\d+)月(\d+)日", text)
+    if m:
+        return f"{m.group(1)}月{m.group(2)}日"
+
+    # 兜底：发布日期
+    return f"{pub_dt.month}月{pub_dt.day}日"
+
+
 if __name__ == "__main__":
     # 测试用
     import json
