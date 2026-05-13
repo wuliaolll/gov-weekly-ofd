@@ -171,6 +171,53 @@ def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[
     """
     title = _clean_title_text(title)
 
+    # --- 末尾"人名+出席类动词"检测（jieba POS版），强制另起一行 ---
+    # 用 jieba 分词，从末尾往前收集 nr/nz 标注的人名 token，避免正则误将正文内容纳入
+    _ATTEND_VERBS = ['出席并讲话', '出席并主持', '出席', '参加', '列席', '主持', '致辞', '陪同', '参会']
+    _HARD_STOP = frozenset({'v', 'vd', 'd', 'p', 'c', 'm', 'q', 'r', 'f', 'a', 'ad', 'eng', 'x', 'w'})
+
+    for _tv in _ATTEND_VERBS:
+        if not title.endswith(_tv):
+            continue
+        _prefix = title[:-len(_tv)]
+        if not _prefix:
+            break
+        try:
+            import jieba.posseg as _pseg
+            _toks = [(w, f) for w, f in _pseg.cut(_prefix)]
+        except Exception:
+            break
+        # 第一轮：严格扫描，只接受 jieba 明确标注为人名的 nr/nz token
+        _j = len(_toks) - 1
+        while _j >= max(0, len(_toks) - 6) and _toks[_j][1] in ('nr', 'nz'):
+            _j -= 1
+        _ps = _j + 1
+
+        # 第二轮（兜底）：若一个 nr/nz 都未找到，放宽为 2~4字 CJK 且非明确停止词性
+        if _ps == len(_toks):
+            _j = len(_toks) - 1
+            _cnt = 0
+            while _j >= max(0, len(_toks) - 5) and _cnt < 4:
+                _w, _f = _toks[_j]
+                if all('\u4e00' <= _c <= '\u9fff' for _c in _w) and 2 <= len(_w) <= 4 and _f not in _HARD_STOP:
+                    _j -= 1
+                    _cnt += 1
+                else:
+                    break
+            _ps = _j + 1
+            # 宽松扫描结果须至少含 1 个 nr/nz token 才采信，避免把正文词误判为人名
+            if not any(_f in ('nr', 'nz') for _, _f in _toks[_ps:]):
+                break
+
+        if _ps < len(_toks):
+            _split = sum(len(_w) for _w, _ in _toks[:_ps])
+            _main = title[:_split].strip()
+            _tail = title[_split:].strip()
+            # tail 须有内容且能放入一行
+            if _main and 2 <= _text_width(_tail) <= max_width:
+                return _smart_title_lines(_main, max_width) + [_tail]
+        break
+
     total = _text_width(title)
     if total <= max_width:
         return [title]
@@ -245,7 +292,10 @@ def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[
                '高质量发展', '春季学期', '秋季学期',
                '营商环境', '经济社会', '投融资',
                '城建领域', '体制改革', '专题会议', '常务会议',
-               '深入推进', '扎实推进', '统筹推进', '科学务实'):
+               '深入推进', '扎实推进', '统筹推进', '科学务实',
+               '支点建设', '决定性进展', '历史性成就', '历史性变革',
+               '根本性改变', '全局性影响', '战略性机遇', '结构性改革',
+               '系统性重塑', '整体性推进', '制度性安排'):
         jieba.add_word(cw)
 
     # 词性标注
@@ -266,6 +316,13 @@ def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[
                 and flags[i + 1].startswith('v')):
             merged_words.append(words[i] + words[i + 1])
             merged_flags.append(flags[i + 1])
+            i += 2
+        # "X性"区别词/形容词(≤4) + 名词 → 整体（如"决定性进展"、"历史性成就"）
+        elif (i + 1 < len(words)
+              and words[i].endswith('性') and 2 <= len(words[i]) <= 4
+              and flags[i + 1] in {'n', 'vn', 'nz', 'ns', 'nt', 'l', 'v'}):
+            merged_words.append(words[i] + words[i + 1])
+            merged_flags.append('n')
             i += 2
         # 短内容词(≤2) + 短修饰词(≤2) → 并列修饰语 (科学+务实)
         # 排除：前一个词是动词（说明当前词是宾语，不应与后面合并）
@@ -288,6 +345,17 @@ def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[
     # ---- Phase 2: 为每个词边界计算语义断点分数 ----
     _NOUN_POS = {'n', 'vn', 'ns', 'nt', 'nz', 'l'}
     _STICKY_POS = {'d', 'a', 'ad', 'p', 'c', 'f', 'r', 'm', 'q', 'vd'}
+    # 中文排版禁则字符集（定义在循环外避免重复构建）
+    _LINE_START_FORBIDDEN = frozenset(
+        '\uff01\uff1f\u3002\uff0c\u3001\uff1b\uff1a\uff09\u300d\u300f\u3011\u3015\u3009\u300b\u2026\u2014\uff5e\u30fb'
+        '\u201d\u2019'   # "\u201d = "  \u2019 = '
+        '！？。，、；：）」』】〕〉》…—～·'
+    )
+    _LINE_END_FORBIDDEN = frozenset(
+        '\uff08\u300c\u300e\u3010\u3014\u3008\u300a'
+        '\u201c\u2018'   # "\u201c = "  \u2018 = '
+        '（「『【〔〈《'
+    )
 
     break_positions = []  # [(char_pos, penalty)]
     pos = 0
@@ -345,6 +413,15 @@ def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[
             if (flag_i.startswith('v') and flag_next.startswith('v')
                     and len(w) <= 2 and len(words[i + 1]) <= 2):
                 penalty += 5.0
+
+            # --- 中文排版禁则 ---
+            # 下一行首字符不得是句末标点/右括号/右引号；行尾不得是左括号/左引号
+            next_char = title[pos] if pos < len(title) else ''
+            prev_char = title[pos - 1] if pos > 0 else ''
+            if next_char in _LINE_START_FORBIDDEN:
+                penalty += 50.0   # 极高惩罚，几乎禁止在此断行
+            if prev_char in _LINE_END_FORBIDDEN:
+                penalty += 50.0
 
             break_positions.append((pos, penalty))
 
@@ -469,6 +546,7 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
     top_spacer.paragraph_format.space_before = Pt(0)
     top_spacer.paragraph_format.space_after = Pt(0)
     _set_line_spacing_fixed(top_spacer, 32)
+    _set_paragraph_shading_white(top_spacer)
 
     # 标题（智能折行：每行独立段落，均居中，行间距固定 32pt）
     # 每行用独立 <w:p> 而非 <w:br/>，使 Word 中每行都显示为"正常段落换行"（←/¶）。
@@ -479,6 +557,7 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
         _set_line_spacing_fixed(title_para, 32)
         title_para.paragraph_format.space_before = Pt(0)
         title_para.paragraph_format.space_after = Pt(0)
+        _set_paragraph_shading_white(title_para)
         # 拆分中文和英文/数字，分别设置字体
         for text, is_ascii in _split_cn_en(line):
             title_run = title_para.add_run(text)
@@ -494,6 +573,7 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
     spacer.paragraph_format.space_before = Pt(0)
     spacer.paragraph_format.space_after = Pt(0)
     _set_line_spacing_fixed(spacer, 32)
+    _set_paragraph_shading_white(spacer)
 
     # 正文段落
     if paragraphs:
@@ -511,6 +591,7 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
             sp.paragraph_format.space_before = Pt(0)
             sp.paragraph_format.space_after = Pt(0)
             _set_line_spacing_fixed(sp, 32)
+            _set_paragraph_shading_white(sp)
 
         p = doc.add_paragraph()
         if para_align == "center":
@@ -522,6 +603,7 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0)
         _set_line_spacing_fixed(p, 32)
+        _set_paragraph_shading_white(p)
 
         # 拆分中文和英文/数字，分别设置字体
         segments = _split_cn_en(para_text)
@@ -555,7 +637,10 @@ def _set_line_spacing_fixed(paragraph, pt_value: int):
 
 
 def _set_font_name(run, cn_name: str, en_name: str):
-    """设置中英文字体名"""
+    """设置中英文字体名。
+    w:hAnsi 和 w:cs 统一用 cn_name，确保引号、省略号、破折号等 hAnsi 范围内的
+    标点字符也使用中文字体（Word/WPS 对这些字符优先取 w:hAnsi，不取 w:eastAsia）。
+    """
     run.font.name = en_name
     r = run._element
     rPr = r.get_or_add_rPr()
@@ -564,9 +649,21 @@ def _set_font_name(run, cn_name: str, en_name: str):
         rFonts = rPr.makeelement(qn("w:rFonts"), {})
         rPr.append(rFonts)
     rFonts.set(qn("w:ascii"), en_name)
-    rFonts.set(qn("w:hAnsi"), en_name)
+    rFonts.set(qn("w:hAnsi"), cn_name)   # 修复：引号等标点用中文字体而非英文内部名
     rFonts.set(qn("w:eastAsia"), cn_name)
-    rFonts.set(qn("w:cs"), en_name)
+    rFonts.set(qn("w:cs"), cn_name)       # 修复：复杂文种字体同样用中文字体名
+
+
+def _set_paragraph_shading_white(paragraph):
+    """为段落设置纯白色底纹（非纸张背景，是段落字符底纹）。"""
+    pPr = paragraph._element.get_or_add_pPr()
+    shd = pPr.find(qn("w:shd"))
+    if shd is None:
+        shd = pPr.makeelement(qn("w:shd"), {})
+        pPr.append(shd)
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), "FFFFFF")
 
 
 def _set_first_line_indent_chars(paragraph, chars: int):

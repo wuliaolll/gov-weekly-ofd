@@ -43,7 +43,8 @@ output/领导动态/
 
 - `end_dt` = 当前时刻
 - 查 `export_history.json`（key = `YYYY-MM-DD`，value = ISO 时间戳）
-- 若昨天有导出记录 → `start_dt` = 昨天的导出时间戳；否则 = 昨天 `00:00:00`
+- 优先查**今天**的记录（同天多次导出场景），无则查**昨天**，再无则回退到昨天 `00:00:00`
+- `start_from` 可由前端手动覆盖（ISO datetime 字符串）
 - 导出成功后写入今天的时间戳
 - 同天多次导出：跳过已存在的 DOCX/OFD 文件，更新时间戳
 
@@ -64,10 +65,11 @@ output/领导动态/
 |---------|------|
 | `DAILY_OUTPUT_DIR` | `output/领导动态/` 路径常量 |
 | `EXPORT_HISTORY_PATH` | `export_history.json` 路径常量 |
-| `compute_export_window()` | 计算 `(start_dt, end_dt)` |
+| `compute_export_window(start_from=None)` | 计算 `(start_dt, end_dt)`；`start_from` 不为 None 时直接用作起始时间 |
 | `save_export_record(end_dt)` | 写入今天导出时间戳 |
-| `do_daily_export()` | 后台线程主逻辑，与旧任务共用 `task_lock` |
-| `POST /api/daily-export` | 触发每日导出 |
+| `do_daily_export(start_from=None)` | 后台线程主逻辑，与旧任务共用 `task_lock` |
+| `POST /api/daily-export` | 触发每日导出；接受可选 `{"start_from": "ISO字符串"}` 请求体 |
+| `GET /api/export-history` | 返回 `export_history.json` 全部内容（`{}` 如无记录）|
 | `GET /api/daily-download/<path>` | 下载单个每日动态文件 |
 | `GET /api/daily-download-zip/<path>` | 打包下载某次导出目录 |
 | `GET /api/reports` | 返回结构改为 `{"weekly": [...], "daily": [...]}` |
@@ -76,12 +78,16 @@ output/领导动态/
 
 - 配置区新增"每日导出"按钮，调用 `POST /api/daily-export`
 - 文件列表区改为 Tab 切换（每日动态 / 政务周报）
-- 新增 Alpine.js 状态：`activeTab`、`dailyReports`、`dailyExport()`
+- 新增 Alpine.js 状态：`activeTab`、`dailyReports`、`exportHistory`、`dailyStartFrom`
+- 新增方法：`dailyExport()`（携带可选 `start_from`）、`loadExportHistory()`
+- 新增计算属性：`lastExportTime`（取最新导出记录）、`computedStartFrom`（手动指定优先，否则自动推算）
+- 按钮下方显示「上次导出时间」和「本次起始时间」，提供 `datetime-local` 输入供手动覆盖，有覆盖值时显示「重置」按钮
+- 任务结束后自动调用 `loadExportHistory()` 刷新导出历史
 - `loadReports()` 适配新响应结构 `{weekly, daily}`
 
 ## 不修改的文件
 
-`config.json`、`doc_generator.py`、`scheduler.py`
+`config.json`、`scheduler.py`
 
 ## 开发过程修复的 Bug
 
@@ -89,3 +95,7 @@ output/领导动态/
 |-----|------|------|
 | `discover_leaders` 返回 0 条 | 原代码只匹配 `^/szf/sld/...` 纯路径，页面实际使用 `//`、`http://`、`https://` 三种前缀 | 改为 `re.search` 子串匹配 `/szf/sld/` |
 | 活动列表混入导航链接 | "会议•活动"栏目标题的 URL 为目录路径（无 `.shtml` 后缀），被误采集 | 新增 `.shtml` 后缀过滤，最小标题长度从 4 改为 7 |
+| 同天第二次导出仍以昨天 0 点为起始 | `save_export_record` 写今天的 key，`compute_export_window` 只查昨天的 key | 优先查今天的 key，再查昨天，最后回退昨天 00:00 |
+| `pollStatus` 结束后未刷新导出历史 | 任务完成回调只调用了 `loadReports()`，未更新 `exportHistory` | 补加 `await this.loadExportHistory()` |
+| 文后作者署名未清除（多人名如`（杨念明、王馨）`） | 原正则只匹配 ≤8 字且不含顿号 | 增加整段弹出 + 新正则，覆盖多人名（含`、`/`，`分隔）和含"记者"两种形式 |
+| `'pair' object is not subscriptable` | jieba `pair` namedtuple 不支持下标访问 | `list(pseg.cut(...))` 改为 `[(w, f) for w, f in pseg.cut(...)]` |

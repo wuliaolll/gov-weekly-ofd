@@ -1048,16 +1048,33 @@ def fetch_article_content(url: str) -> dict:
     if body_title_parts:
         title = "".join(body_title_parts)
 
-    # 清理末尾段落中拼接的记者署名，如 "...发展。（湖北日报记者邓伟）"
+    # 清理末尾段落中拼接的记者/作者署名
+    # 匹配形如：（湖北日报记者邓伟）、（杨念明、王馨）、(张三） 等
+    _AUTHOR_RE = re.compile(
+        r'[（(]'
+        r'(?:[\u4e00-\u9fff\s\u3000、，·・•\-—]{1,30}?记者[\u4e00-\u9fff\s\u3000、，·・•\-—]{0,20}'  # 含"记者"
+        r'|[\u4e00-\u9fff]{2,4}(?:[、，]\s*[\u4e00-\u9fff]{2,4}){0,9}'                             # 多个姓名，用、或，分隔
+        r')'
+        r'[）)]\s*$'
+    )
     if content_paragraphs:
-        last = content_paragraphs[-1]
-        if isinstance(last, dict):
-            cleaned = re.sub(r'[（(][^）)]*?记者[^）)]*?[）)]\s*$', '', last["text"]).strip()
-            cleaned = re.sub(r'[（(][\u4e00-\u9fff\s\u3000]{1,8}[）)]\s*$', '', cleaned).strip()
-            if cleaned:
-                content_paragraphs[-1] = {**last, "text": cleaned}
-            else:
+        # 从末尾连续弹出纯署名段落（整段就是括号作者名）
+        while content_paragraphs:
+            last = content_paragraphs[-1]
+            last_text = last["text"] if isinstance(last, dict) else last
+            if re.fullmatch(r'\s*[（(][\u4e00-\u9fff\s、，·・•]{1,40}[）)]\s*', last_text):
                 content_paragraphs.pop()
+            else:
+                break
+        # 清理最后一段末尾附带的署名
+        if content_paragraphs:
+            last = content_paragraphs[-1]
+            if isinstance(last, dict):
+                cleaned = _AUTHOR_RE.sub('', last["text"]).strip()
+                if cleaned:
+                    content_paragraphs[-1] = {**last, "text": cleaned}
+                else:
+                    content_paragraphs.pop()
 
     content = "\n\n".join(
         p["text"] if isinstance(p, dict) else p for p in content_paragraphs
