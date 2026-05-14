@@ -87,9 +87,13 @@ def _register_reportlab_fonts():
 
 # ============ 标题智能折行 ============
 
-# 版心宽度: 21cm - 3.2cm - 3.2cm = 14.6cm; 标题 22pt，每 CJK 字符约 22pt 宽
-# 14.6cm ≈ 414pt → 414/22 ≈ 18.8; 实测 Word 中 18 个全角字符刚好一行
-_TITLE_MAX_CHARS = 18.0
+# 版心宽度: 21cm - 3.2cm - 3.2cm = 14.6cm ≈ 414pt
+# 当前标题字号为小二（18pt），单行可容纳约 23 个全角字符（414/18 ≈ 23）
+_TITLE_MAX_CHARS = 23.0
+
+# 公文字号常量（按最新需求）
+_TITLE_FONT_PT = 18  # 小二
+_BODY_FONT_PT = 16   # 三号
 
 
 def _char_width(ch: str) -> float:
@@ -169,6 +173,31 @@ def _smart_title_lines(title: str, max_width: float = _TITLE_MAX_CHARS) -> list[
        - 评分 = 断点语义惩罚之和（越低越好）
        - 轻微均匀性偏好作为 tiebreaker
     """
+    # 优先保留网页原有换行：仅当某行超宽时，再对该行执行智能折行。
+    if any(sep in title for sep in ("\r\n", "\r", "\n", "\u2028", "\u2029", "\u0085")):
+        normalized = (
+            title.replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\u2028", "\n")
+            .replace("\u2029", "\n")
+            .replace("\u0085", "\n")
+        )
+        raw_lines = [line for line in normalized.split("\n") if line.strip()]
+        if raw_lines:
+            web_lines = [_clean_title_text(line) for line in raw_lines]
+            web_lines = [line for line in web_lines if line]
+            if web_lines:
+                if all(_text_width(line) <= max_width for line in web_lines):
+                    return web_lines
+                expanded_lines = []
+                for line in web_lines:
+                    if _text_width(line) <= max_width:
+                        expanded_lines.append(line)
+                    else:
+                        expanded_lines.extend(_smart_title_lines(line, max_width))
+                if expanded_lines:
+                    return expanded_lines
+
     title = _clean_title_text(title)
 
     # --- 末尾"人名+出席类动词"检测（jieba POS版），强制另起一行 ---
@@ -517,8 +546,8 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
     按公文格式生成 DOCX 文件
 
     页面: A4, 页边距上3.7cm 下3.0cm 左3.2cm 右3.2cm
-    标题: 方正小标宋简体, 二号(22pt), 居中, 第二行, 与正文空一行
-    正文: 仿宋GB2312, 小二号(18pt), 首行缩进2字符, 行距固定32磅, 两端对齐
+    标题: 方正小标宋简体, 小二号(18pt), 居中, 第二行, 与正文空一行
+    正文: 仿宋GB2312, 三号(16pt), 首行缩进2字符, 行距固定32磅, 两端对齐
     数字英文: Times New Roman
     颜色: 黑色
     无页码, 无图片
@@ -545,23 +574,23 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
     top_spacer = doc.add_paragraph()
     top_spacer.paragraph_format.space_before = Pt(0)
     top_spacer.paragraph_format.space_after = Pt(0)
-    _set_line_spacing_fixed(top_spacer, 32)
+    _set_line_spacing_fixed(top_spacer, 28)
     _set_paragraph_shading_white(top_spacer)
 
-    # 标题（智能折行：每行独立段落，均居中，行间距固定 32pt）
+    # 标题（智能折行：每行独立段落，均居中，行间距固定 28pt）
     # 每行用独立 <w:p> 而非 <w:br/>，使 Word 中每行都显示为"正常段落换行"（←/¶）。
     title_lines = _smart_title_lines(title)
     for line in title_lines:
         title_para = doc.add_paragraph()
         title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        _set_line_spacing_fixed(title_para, 32)
+        _set_line_spacing_fixed(title_para, 28)
         title_para.paragraph_format.space_before = Pt(0)
         title_para.paragraph_format.space_after = Pt(0)
         _set_paragraph_shading_white(title_para)
         # 拆分中文和英文/数字，分别设置字体
         for text, is_ascii in _split_cn_en(line):
             title_run = title_para.add_run(text)
-            title_run.font.size = Pt(22)  # 二号
+            title_run.font.size = Pt(_TITLE_FONT_PT)  # 小二号
             if is_ascii:
                 _set_font_name(title_run, "Times New Roman", "Times New Roman")
             else:
@@ -572,7 +601,7 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
     spacer = doc.add_paragraph()
     spacer.paragraph_format.space_before = Pt(0)
     spacer.paragraph_format.space_after = Pt(0)
-    _set_line_spacing_fixed(spacer, 32)
+    _set_line_spacing_fixed(spacer, 28)
     _set_paragraph_shading_white(spacer)
 
     # 正文段落
@@ -590,7 +619,7 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
             sp = doc.add_paragraph()
             sp.paragraph_format.space_before = Pt(0)
             sp.paragraph_format.space_after = Pt(0)
-            _set_line_spacing_fixed(sp, 32)
+            _set_line_spacing_fixed(sp, 28)
             _set_paragraph_shading_white(sp)
 
         p = doc.add_paragraph()
@@ -602,14 +631,14 @@ def generate_docx(title: str, content: str, output_path: str, paragraphs: list[d
             _set_first_line_indent_chars(p, 2)  # 严格2字符缩进
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0)
-        _set_line_spacing_fixed(p, 32)
+        _set_line_spacing_fixed(p, 28)
         _set_paragraph_shading_white(p)
 
         # 拆分中文和英文/数字，分别设置字体
         segments = _split_cn_en(para_text)
         for text, is_ascii in segments:
             run = p.add_run(text)
-            run.font.size = Pt(18)  # 小二号
+            run.font.size = Pt(_BODY_FONT_PT)  # 三号
             if is_ascii:
                 _set_font_name(run, "Times New Roman", "Times New Roman")
             else:
@@ -675,8 +704,8 @@ def _set_first_line_indent_chars(paragraph, chars: int):
         pPr.append(ind)
     # w:firstLineChars 单位: 1/100 字符，2字符 = 200
     ind.set(qn("w:firstLineChars"), str(chars * 100))
-    # w:firstLine 单位: twips（1/20 pt），18pt * 2 = 36pt = 720 twips（作为回退值）
-    ind.set(qn("w:firstLine"), str(int(18 * 2 * 20)))
+    # w:firstLine 单位: twips（1/20 pt），正文三号16pt * 2 字符 = 32pt = 640 twips（回退值）
+    ind.set(qn("w:firstLine"), str(int(_BODY_FONT_PT * 2 * 20)))
 
 
 def _split_cn_en(text: str) -> list[tuple[str, bool]]:
@@ -755,8 +784,8 @@ def generate_ofd(title: str, content: str, output_path: str, paragraphs: list[di
     title_style = ParagraphStyle(
         "GovTitle",
         fontName=title_font,
-        fontSize=22,
-        leading=32,
+        fontSize=_TITLE_FONT_PT,
+        leading=28,
         alignment=TA_CENTER,
         textColor="black",
         spaceAfter=0,
@@ -767,10 +796,10 @@ def generate_ofd(title: str, content: str, output_path: str, paragraphs: list[di
     body_style = ParagraphStyle(
         "GovBody",
         fontName=body_font,
-        fontSize=18,
-        leading=32,
+        fontSize=_BODY_FONT_PT,
+        leading=28,
         alignment=TA_JUSTIFY,
-        firstLineIndent=18 * 2,  # 严格 2 字符：CJK 全角宽 = fontSize，2字符 = 36pt
+        firstLineIndent=_BODY_FONT_PT * 2,  # 严格 2 字符：CJK 全角宽 = fontSize
         textColor="black",
         spaceAfter=0,
         spaceBefore=0,
@@ -791,7 +820,7 @@ def generate_ofd(title: str, content: str, output_path: str, paragraphs: list[di
     story = []
 
     # 标题上方空一行
-    story.append(Spacer(1, 32))
+    story.append(Spacer(1, 28))
 
     # 标题（智能折行）
     en_font = "TimesNewRoman" if TNR_PATH else None
@@ -802,14 +831,14 @@ def generate_ofd(title: str, content: str, output_path: str, paragraphs: list[di
     story.append(Paragraph(safe_title, title_style))
 
     # 标题与正文间空一行
-    story.append(Spacer(1, 32))
+    story.append(Spacer(1, 28))
 
     # 居中样式（用于居中段落）
     center_body_style = ParagraphStyle(
         "GovBodyCenter",
         fontName=body_font,
-        fontSize=18,
-        leading=32,
+        fontSize=_BODY_FONT_PT,
+        leading=28,
         alignment=TA_CENTER,
         firstLineIndent=0,
         textColor="black",
@@ -829,7 +858,7 @@ def generate_ofd(title: str, content: str, output_path: str, paragraphs: list[di
         para_align = para_info.get("align", "left") if isinstance(para_info, dict) else "left"
         # 居中段落后接正文段落时，插入一个空行
         if prev_align == "center" and para_align != "center":
-            story.append(Spacer(1, 32))
+            story.append(Spacer(1, 28))
         safe_text = _rl_mixed_font_text(para_text, body_font, en_font)
         style = center_body_style if para_align == "center" else body_style
         story.append(Paragraph(safe_text, style))

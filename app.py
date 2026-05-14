@@ -106,6 +106,10 @@ def save_config(cfg: dict):
 
 def safe_filename(name: str, max_len: int = 80) -> str:
     """生成安全的文件/目录名"""
+    # 换行/回车等控制字符替换为空格，再合并多余空格
+    import re as _re
+    name = _re.sub(r'[\r\n\t\x00-\x1f\x7f]', ' ', name)
+    name = _re.sub(r' {2,}', ' ', name)
     for ch in r'\/:*?"<>|':
         name = name.replace(ch, "")
     name = name.strip(". ")

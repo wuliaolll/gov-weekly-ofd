@@ -774,7 +774,8 @@ def parse_weekly_report(report_url: str) -> dict:
 
     # 获取标题
     title_tag = soup.select_one("h1") or soup.select_one("title")
-    title = title_tag.get_text(strip=True) if title_tag else ""
+    # 保留网页标题中的 <br>/块级换行信息，后续由文档生成器优先沿用。
+    title = title_tag.get_text("\n", strip=True) if title_tag else ""
     # 清理标题中的站点后缀
     title = re.sub(r"\s*-\s*湖北省人民政府门户网站.*$", "", title)
 
@@ -974,7 +975,8 @@ def fetch_article_content(url: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
 
     title_tag = soup.select_one("h1") or soup.select_one("title")
-    title = title_tag.get_text(strip=True) if title_tag else ""
+    # 保留网页标题中的 <br>/块级换行信息，后续由文档生成器优先沿用。
+    title = title_tag.get_text("\n", strip=True) if title_tag else ""
     title = re.sub(r"\s*-\s*湖北省人民政府门户网站.*$", "", title)
 
     # 发布时间
@@ -1046,7 +1048,7 @@ def fetch_article_content(url: str) -> dict:
         else:
             break
     if body_title_parts:
-        title = "".join(body_title_parts)
+        title = "\n".join(body_title_parts)
 
     # 清理末尾段落中拼接的记者/作者署名
     # 匹配形如：（湖北日报记者邓伟）、（杨念明、王馨）、(张三） 等
@@ -1080,11 +1082,12 @@ def fetch_article_content(url: str) -> dict:
         p["text"] if isinstance(p, dict) else p for p in content_paragraphs
     )
 
-    # 清洗标题：把所有 Unicode 空格（Zs 类）归一为普通空格，去除控制字符。
+    # 清洗标题：把所有 Unicode 空格（Zs 类）归一为普通空格，去除控制字符（保留换行符 \n，供折行逻辑使用）。
     title = "".join(
+        "\n" if ch == "\n" else
         " " if (unicodedata.category(ch) == "Zs") else ch
         for ch in title
-        if unicodedata.category(ch) not in {"Cc", "Cf"}
+        if ch == "\n" or unicodedata.category(ch) not in {"Cc", "Cf"}
     )
     title = re.sub(r" {2,}", " ", title).strip()
 
